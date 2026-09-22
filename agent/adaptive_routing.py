@@ -635,12 +635,22 @@ def _escalation_pairs(
     model: str,
     tiers: Any,
     max_escalations: int,
+    requires_vision: bool = False,
 ) -> Tuple[Tuple[str, str], ...]:
+    """Stronger configured tiers, in ladder order, deduped and truncated.
+
+    ``multimodal`` is a *capability* tier (vision), not a strength tier: it sits
+    after ``workhorse`` in :data:`TIER_ORDER`, so a naive walk would tell a
+    text-only task to escalate into a vision model. It is therefore only
+    reachable when the task actually requires vision.
+    """
     if max_escalations <= 0 or tier not in TIER_ORDER:
         return ()
     seen = {(provider, model)}
     chain: List[Tuple[str, str]] = []
     for candidate in TIER_ORDER[TIER_ORDER.index(tier) + 1 :]:
+        if candidate == "multimodal" and not requires_vision:
+            continue
         for entry in _tier_entries(tiers, candidate):
             key = (entry["provider"], entry["model"])
             if key in seen:
@@ -755,7 +765,12 @@ def resolve_route(
         model=model,
         reasoning_effort=effort,
         escalation_chain=_escalation_pairs(
-            tier, provider, model, tiers, cfg["max_escalations"]
+            tier,
+            provider,
+            model,
+            tiers,
+            cfg["max_escalations"],
+            requires_vision=requires_vision,
         ),
         complexity_class=complexity,
         reason_codes=codes,

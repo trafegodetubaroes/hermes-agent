@@ -33,6 +33,7 @@ from agent.adaptive_routing import (
     COMPLEXITY_CLASSES,
     MODES,
     TIER_ORDER,
+    TaskSignals,
     build_escalation_chain,
     classify_task,
     load_adaptive_config,
@@ -987,3 +988,37 @@ def test_default_config_ships_the_adaptive_routing_block_disabled():
     assert set(section["tiers"]) == set(TIER_ORDER)
     # Tiers ship empty: real model IDs are install-specific, never hardcoded.
     assert all(section["tiers"][tier] == [] for tier in TIER_ORDER)
+
+
+def test_escalation_chain_skips_multimodal_for_text_only_tasks():
+    """A text-only task must never be told to escalate INTO the multimodal tier.
+
+    The ladder orders ``multimodal`` right after ``workhorse``, so a naive
+    "next configured tier" walk suggests a vision model for a pure-text task.
+    Vision-only tiers are reachable only when the task actually needs vision.
+    """
+    config = _config(max_escalations=4, tiers=_tiers())
+    multimodal_ids = {(e["provider"], e["model"]) for e in config["tiers"]["multimodal"]}
+    assert multimodal_ids, "fixture must configure a multimodal tier"
+
+    text_signals = TaskSignals(
+        complexity_class="NORMAL",
+        score=2,
+        requires_vision=False,
+        reason_codes=("code_intent",),
+    )
+    text_decision = resolve_route(text_signals, config=config)
+    assert text_decision.tier == "workhorse"
+    assert not (set(text_decision.escalation_chain) & multimodal_ids), (
+        "text-only escalation chain leaked multimodal tier entries: "
+        f"{text_decision.escalation_chain}"
+    )
+
+    vision_signals = TaskSignals(
+        complexity_class="NORMAL",
+        score=2,
+        requires_vision=True,
+        reason_codes=("has_images",),
+    )
+    vision_decision = resolve_route(vision_signals, config=config)
+    assert vision_decision.tier == "multimodal"
