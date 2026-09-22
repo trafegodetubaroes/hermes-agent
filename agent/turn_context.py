@@ -498,6 +498,41 @@ def build_turn_context(
     except Exception:
         pass
 
+    # Phase 1 adaptive routing: SHADOW-ONLY first-turn observer. When (and only
+    # when) ``agent.adaptive_routing.enabled`` is true in config.yaml, this
+    # classifies THIS first turn's message with a pure deterministic heuristic
+    # and appends what a router *would* have chosen to
+    # <HERMES_HOME>/adaptive_routing_shadow.jsonl, next to the provider/model
+    # that are actually in use. It deliberately changes NOTHING about the turn:
+    # no model/provider switch, no fallback chain, no LLM call, no extra log
+    # line, and no message/tool/system-prompt mutation. Disabled (the default)
+    # it short-circuits on one cached-config read inside observe_shadow_route,
+    # before any classification or file work. The whole call is wrapped so a
+    # routing *hint* can never break a turn.
+    try:
+        from agent.adaptive_routing import observe_shadow_route
+
+        # Image payloads arrive as non-str content (dict/attachment), or as a
+        # list of content blocks carrying an image part.
+        _shadow_has_images = False
+        if user_message is not None and not isinstance(user_message, (str, list, tuple)):
+            _shadow_has_images = True
+        elif isinstance(user_message, (list, tuple)):
+            for _shadow_part in user_message:
+                if isinstance(_shadow_part, dict) and str(
+                    _shadow_part.get("type", "")
+                ).strip().lower() in ("image", "image_url", "input_image"):
+                    _shadow_has_images = True
+                    break
+        observe_shadow_route(
+            agent=agent,
+            user_message=user_message,
+            conversation_history=conversation_history,
+            has_images=_shadow_has_images,
+        )
+    except Exception:
+        logger.debug("adaptive routing shadow observer skipped", exc_info=True)
+
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
     # connect, missing the bounded startup wait) lands in THIS turn's tool

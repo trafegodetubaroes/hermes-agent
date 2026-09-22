@@ -192,6 +192,45 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
+        # Phase 1 of the opt-in adaptive router: SHADOW ONLY. When enabled, the
+        # first turn of a session is classified with a pure, deterministic
+        # heuristic (no LLM call) and the tier a router *would* have chosen is
+        # appended to <HERMES_HOME>/adaptive_routing_shadow.jsonl next to the
+        # provider/model actually in use. Nothing is applied: the effective
+        # model never changes in this phase, and with ``enabled: false`` (the
+        # default) the whole feature is inert — no file, no log line, no extra
+        # work beyond one cached-config read.
+        #
+        # ``tiers`` maps the ordered ladder (local → free → workhorse →
+        # multimodal → premium → frontier) onto the provider/model pairs THIS
+        # install actually has, e.g.:
+        #   tiers:
+        #     local:
+        #       - provider: ollama
+        #         model: qwen3:4b
+        #         reasoning_effort: low
+        #     workhorse:
+        #       - provider: <your-provider>
+        #         model: <your-model>
+        # They ship EMPTY on purpose — model IDs are install-specific and are
+        # never hardcoded in source. Empty tiers mean "no suggestion", not an
+        # error. ``mode`` is one of economy | balanced | quality | maximum;
+        # ``max_escalations`` bounds how many stronger tiers are recorded as
+        # the suggested escalation chain.
+        "adaptive_routing": {
+            "enabled": False,
+            "shadow_mode": True,
+            "mode": "balanced",
+            "max_escalations": 2,
+            "tiers": {
+                "local": [],
+                "free": [],
+                "workhorse": [],
+                "multimodal": [],
+                "premium": [],
+                "frontier": [],
+            },
+        },
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
