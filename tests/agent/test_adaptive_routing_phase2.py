@@ -75,6 +75,9 @@ def _plan(**overrides):
         "explicit_pin": False,
         "has_history": False,
         "has_images": False,
+        # Phase 3: an application must name its surface; this helper stands in
+        # for the CLI, which is on the allowlist by default.
+        "surface": "cli",
     }
     args.update(overrides)
     return ar.plan_route_application(**args)

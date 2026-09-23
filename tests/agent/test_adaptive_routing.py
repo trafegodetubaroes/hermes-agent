@@ -708,6 +708,7 @@ def test_record_shadow_decision_writes_one_bounded_line_and_no_user_text(tmp_pat
         "effective_model",
         "applied",
         "matched",
+        "surface",
         "router_version",
     }
     assert isinstance(record["ts"], (int, float))

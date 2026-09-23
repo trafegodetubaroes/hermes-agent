@@ -152,6 +152,18 @@ Depois de avaliação, habilitar somente para novas sessões e superfícies sele
 
 ### Fase 3 — expansão controlada
 
+> **Implementada em 2026-09-23** (branch `feature/hair-phase0`, router
+> `phase3-1`, 39 testes novos em `tests/agent/test_adaptive_routing_phase3.py`).
+> Entregue como gates opt-in em `agent.adaptive_routing`, todos com default que
+> preserva o comportamento da Phase 2 — nada muda até serem ligados:
+> `surfaces` (allowlist de quem pode APLICAR; só cli+gateway por default,
+> fail-closed para superfícies desconhecidas), `budget` (teto diário de rotas
+> aplicadas por tier, contado do próprio log; tier gasto faz o roteador descer
+> a escada, nunca subir) e `data_policy` (`local_only_classes` — classes que
+> não saem da máquina; `forbidden_tiers` — tiers nunca selecionados nem
+> escalados). Um gate negado registra a decisão como `applied=false` com o
+> motivo, para a Phase 4 decidir com evidência em vez de suposição.
+
 Adicionar allowlists por capacidade, budgets e política de dados; testar CLI, gateway, TUI, cron, delegação e auxiliares com `HERMES_HOME` temporário e imports reais. Medir invariantes: alternância de mensagens, cache do prefixo, billing attribution, isolamento de sessão e restauração de fallback.
 
 ### Fase 4 — otimização baseada em evidência

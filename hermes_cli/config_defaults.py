@@ -216,6 +216,20 @@ DEFAULT_CONFIG = {
         # error. ``mode`` is one of economy | balanced | quality | maximum;
         # ``max_escalations`` bounds how many stronger tiers are recorded as
         # the suggested escalation chain.
+        #
+        # Phase 3 (controlled expansion) bounds *where* and *how much* the
+        # router may change; all three gates default to today's behaviour:
+        #   surfaces — allowlist of surfaces allowed to APPLY a route. Only
+        #     cli+gateway are on by default; tui/cron/delegation stay
+        #     observe-only until switched on explicitly, and a surface missing
+        #     from this mapping can never change a route (fail-closed).
+        #   budget — per-day cap of applied routes per tier, counted from the
+        #     routing log itself. A missing tier is uncapped; 0 blocks the
+        #     tier. A spent tier makes the router walk DOWN the ladder only,
+        #     and the route is denied when no cheaper tier is funded.
+        #   data_policy — classes that must stay on the local tier
+        #     (local_only_classes) and tiers that must never be selected nor
+        #     escalated into (forbidden_tiers).
         "adaptive_routing": {
             "enabled": False,
             # Separate execution gate. ``enabled: true`` with this false stays
@@ -227,6 +241,19 @@ DEFAULT_CONFIG = {
             # local tier so prompt content never leaves the machine.
             "privacy": "normal",
             "max_escalations": 2,
+            # Phase 3 gates — inert defaults, see the note above.
+            "surfaces": {
+                "cli": True,
+                "gateway": True,
+                "tui": False,
+                "cron": False,
+                "delegation": False,
+            },
+            "budget": {},
+            "data_policy": {
+                "local_only_classes": [],
+                "forbidden_tiers": [],
+            },
             "tiers": {
                 "local": [],
                 "free": [],

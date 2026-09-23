@@ -3,7 +3,9 @@
 This module answers one question per first turn: *"which tier would a router
 have picked for this message?"* — and records the answer next to the provider
 and model that were actually used. Phase 1 remains an observe-only mode;
-Phase 2 lets CLI and gateway surfaces apply the route before construction:
+Phase 2 lets CLI and gateway surfaces apply the route before construction;
+Phase 3 makes that expansion explicit and bounded — per-surface allowlist,
+per-tier daily budget and a per-class data policy:
 
 * this module never switches a live agent or resolves credentials;
 * it makes **zero** LLM/provider calls — classification is a pure heuristic
@@ -25,6 +27,13 @@ Design constraints encoded here:
 
 Escalation chains remain suggestions and are not wired into the runtime
 fallback mechanism.
+
+Phase 3 gates (all opt-in, all defaulting to today's behaviour):
+
+* ``surfaces`` — allowlist of surfaces allowed to apply (default: cli+gateway);
+* ``budget`` — per-day cap of applied routes per tier (``0`` blocks a tier);
+* ``data_policy.local_only_classes`` — classes that must stay on the local tier;
+* ``data_policy.forbidden_tiers`` — tiers never selected nor escalated into.
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ import re
 import time
 import unicodedata
 from hashlib import sha256
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -65,7 +74,7 @@ MODES: Tuple[str, ...] = ("economy", "balanced", "quality", "maximum")
 
 #: Bumped whenever the classifier/route heuristics change, so shadow logs from
 #: different generations stay distinguishable.
-ROUTER_VERSION = "phase2-prebuild-1"
+ROUTER_VERSION = "phase3-1"
 
 #: One JSON line per observation, appended under HERMES_HOME.
 SHADOW_LOG_NAME = "adaptive_routing_shadow.jsonl"
@@ -94,6 +103,19 @@ _VALID_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"}
 # local tier so no prompt content can leave the machine.
 PRIVACY_VALUES = frozenset({"normal", "local_only"})
 
+#: Surfaces that know how to apply a route. Observing is independent of this
+#: list: a surface absent here simply may not *change* the route.
+SURFACES: Tuple[str, ...] = ("cli", "gateway", "tui", "cron", "delegation")
+
+#: Surfaces allowed to apply when config does not say otherwise. Deliberately
+#: the two surfaces exercised end-to-end in Phase 2; every other surface stays
+#: observe-only until switched on explicitly (the Phase 3 allowlist).
+_DEFAULT_SURFACES: Dict[str, bool] = {"cli": True, "gateway": True}
+
+#: Bounded tail read for the daily budget counter: telemetry is append-only, so
+#: only the newest bytes can hold today's applied routes.
+_BUDGET_READ_BYTES = 512 * 1024
+
 _EXPLICIT_PIN = "explicit_pin"
 _PRIVACY_LOCAL_ONLY = "privacy_local_only"
 _PRIVACY_LOCAL_ONLY_UNAVAILABLE = "privacy_local_only_unavailable"
@@ -108,6 +130,12 @@ _HAS_IMAGES = "has_images"
 _PRIOR_FAILURE = "prior_failure"
 _NON_TEXT_PAYLOAD = "non_text_payload"
 _DEFAULT_REASON = "default"
+_POLICY_LOCAL_ONLY = "policy_local_only"
+_POLICY_LOCAL_ONLY_UNAVAILABLE = "policy_local_only_unavailable"
+_POLICY_TIER_FORBIDDEN = "policy_tier_forbidden"
+_BUDGET_DOWNGRADE = "budget_downgrade"
+_BUDGET_EXHAUSTED = "budget_exhausted"
+_SURFACE_NOT_ALLOWED = "surface_not_allowed"
 
 _TRIVIAL_MAX_CHARS = 120
 _LOW_MAX_CHARS = 320
@@ -254,6 +282,7 @@ _SHADOW_JSON_FIELDS: Tuple[str, ...] = (
     "effective_model",
     "applied",
     "matched",
+    "surface",
     "router_version",
 )
 
@@ -526,6 +555,71 @@ def _normalise_tiers(raw: Any) -> Dict[str, Tuple[Dict[str, str], ...]]:
     return tiers
 
 
+def _normalise_surfaces(raw: Any) -> Dict[str, bool]:
+    """Allowlist of surfaces permitted to apply a route.
+
+    Fail-closed: a value that is not a boolean keeps the default, and the
+    defaults only let the two Phase 2 surfaces apply. Unknown surface names are
+    ignored rather than guessed at.
+    """
+    surfaces: Dict[str, bool] = {
+        name: bool(_DEFAULT_SURFACES.get(name, False)) for name in SURFACES
+    }
+    if isinstance(raw, dict):
+        for name in SURFACES:
+            value = raw.get(name)
+            if isinstance(value, bool):
+                surfaces[name] = value
+    return surfaces
+
+
+def _normalise_budget(raw: Any) -> Dict[str, int]:
+    """Per-day cap on *applied* routes, per tier.
+
+    A missing tier is uncapped; ``0`` blocks the tier outright. Only real,
+    non-negative integers are honoured (``True`` is not ``1`` here).
+    """
+    budget: Dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return budget
+    for tier, value in raw.items():
+        if not isinstance(tier, str) or tier not in TIER_ORDER:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        budget[tier] = value
+    return budget
+
+
+def _normalise_data_policy(raw: Any) -> Dict[str, Tuple[str, ...]]:
+    """Per-class data policy: classes that stay local, tiers never used."""
+    policy: Dict[str, Tuple[str, ...]] = {
+        "local_only_classes": (),
+        "forbidden_tiers": (),
+    }
+    if not isinstance(raw, dict):
+        return policy
+    classes = raw.get("local_only_classes")
+    if isinstance(classes, (list, tuple)):
+        policy["local_only_classes"] = _dedupe(
+            [
+                item.strip().upper()
+                for item in classes
+                if isinstance(item, str) and item.strip().upper() in COMPLEXITY_CLASSES
+            ]
+        )
+    tiers = raw.get("forbidden_tiers")
+    if isinstance(tiers, (list, tuple)):
+        policy["forbidden_tiers"] = _dedupe(
+            [
+                item.strip().lower()
+                for item in tiers
+                if isinstance(item, str) and item.strip().lower() in TIER_ORDER
+            ]
+        )
+    return policy
+
+
 def _normalise_section(section: Any) -> Dict[str, Any]:
     if not isinstance(section, dict):
         section = {}
@@ -548,6 +642,9 @@ def _normalise_section(section: Any) -> Dict[str, Any]:
         "privacy": normalised_privacy,
         "max_escalations": _normalise_max_escalations(section.get("max_escalations")),
         "tiers": _normalise_tiers(section.get("tiers")),
+        "surfaces": _normalise_surfaces(section.get("surfaces")),
+        "budget": _normalise_budget(section.get("budget")),
+        "data_policy": _normalise_data_policy(section.get("data_policy")),
     }
 
 
@@ -634,21 +731,40 @@ def _target_tier(complexity_class: str, requires_vision: bool, mode: str) -> str
 
 
 def _select_tier(
-    mapped: str, tiers: Any
+    mapped: str,
+    tiers: Any,
+    excluded: Iterable[str] = (),
+    requires_vision: bool = False,
 ) -> Tuple[Optional[str], Tuple[str, ...]]:
     """Resolve the mapped tier, falling through to the nearest configured one.
 
     Prefers a *stronger* configured tier (an unconfigured tier must never
-    silently weaken the route), then a weaker one. Returns ``(None, codes)``
-    when nothing at all is configured — the caller then reports an explicitly
-    empty route instead of inventing a half-empty provider/model pair.
+    silently weaken the route), then a weaker one. Tiers in ``excluded`` (the
+    Phase 3 data policy) are never selected, and the reason codes say so.
+    Returns ``(None, codes)`` when nothing eligible is configured — the caller
+    then reports an explicitly empty route instead of inventing a half-empty
+    provider/model pair.
     """
-    if mapped in TIER_ORDER and _tier_entries(tiers, mapped):
+    blocked = {name for name in excluded if isinstance(name, str)}
+    if (
+        mapped in TIER_ORDER
+        and mapped not in blocked
+        and (mapped != "multimodal" or requires_vision)
+        and _tier_entries(tiers, mapped)
+    ):
         return mapped, ()
     start = TIER_ORDER.index(mapped) + 1 if mapped in TIER_ORDER else 0
     for candidate in list(TIER_ORDER[start:]) + list(reversed(TIER_ORDER[:start])):
+        # ``multimodal`` is a capability tier, not a strength tier: a text-only
+        # task must never be walked into a vision model.
+        if candidate in blocked or (candidate == "multimodal" and not requires_vision):
+            continue
         if _tier_entries(tiers, candidate):
+            if mapped in blocked:
+                return candidate, (_POLICY_TIER_FORBIDDEN, _TIER_FALLBACK)
             return candidate, (_TIER_FALLBACK,)
+    if mapped in blocked:
+        return None, (_POLICY_TIER_FORBIDDEN, _TIER_FALLBACK, _NO_TIER_CONFIGURED)
     return None, (_TIER_FALLBACK, _NO_TIER_CONFIGURED)
 
 
@@ -659,6 +775,7 @@ def _escalation_pairs(
     tiers: Any,
     max_escalations: int,
     requires_vision: bool = False,
+    excluded: Iterable[str] = (),
 ) -> Tuple[Tuple[str, str], ...]:
     """Stronger configured tiers, in ladder order, deduped and truncated.
 
@@ -669,10 +786,13 @@ def _escalation_pairs(
     """
     if max_escalations <= 0 or tier not in TIER_ORDER:
         return ()
+    blocked = {name for name in excluded if isinstance(name, str)}
     seen = {(provider, model)}
     chain: List[Tuple[str, str]] = []
     for candidate in TIER_ORDER[TIER_ORDER.index(tier) + 1 :]:
         if candidate == "multimodal" and not requires_vision:
+            continue
+        if candidate in blocked:
             continue
         for entry in _tier_entries(tiers, candidate):
             key = (entry["provider"], entry["model"])
@@ -702,6 +822,9 @@ def resolve_route(
     tiers = cfg["tiers"]
     shadow = bool(cfg["shadow_mode"])
     resolved_mode = _resolve_mode(mode, cfg["mode"])
+    policy = cfg.get("data_policy") or {}
+    local_only_classes = tuple(policy.get("local_only_classes") or ())
+    forbidden_tiers = tuple(policy.get("forbidden_tiers") or ())
 
     base_codes: Tuple[str, ...] = ()
     if isinstance(signals, TaskSignals):
@@ -759,8 +882,42 @@ def resolve_route(
             applied=False,
         )
 
+    if complexity in local_only_classes:
+        # Data policy: this class must never leave the machine. Same shape as
+        # the privacy contract, decided per class instead of globally.
+        entry = _first_entry(tiers, "local")
+        if entry is None:
+            return RouteDecision(
+                tier="",
+                provider="",
+                model="",
+                reasoning_effort="",
+                escalation_chain=(),
+                complexity_class=complexity,
+                reason_codes=_dedupe((_POLICY_LOCAL_ONLY_UNAVAILABLE,) + base_codes),
+                mode=resolved_mode,
+                pinned=False,
+                shadow=shadow,
+                applied=False,
+            )
+        return RouteDecision(
+            tier="local",
+            provider=entry["provider"],
+            model=entry["model"],
+            reasoning_effort=entry["reasoning_effort"],
+            escalation_chain=(),
+            complexity_class=complexity,
+            reason_codes=_dedupe((_POLICY_LOCAL_ONLY,) + base_codes),
+            mode=resolved_mode,
+            pinned=False,
+            shadow=shadow,
+            applied=False,
+        )
+
     mapped = _target_tier(complexity, requires_vision, resolved_mode)
-    tier, tier_codes = _select_tier(mapped, tiers)
+    tier, tier_codes = _select_tier(
+        mapped, tiers, forbidden_tiers, requires_vision=requires_vision
+    )
     codes = _dedupe(tuple(tier_codes) + base_codes)
 
     if tier is None:
@@ -794,6 +951,7 @@ def resolve_route(
             tiers,
             cfg["max_escalations"],
             requires_vision=requires_vision,
+            excluded=forbidden_tiers,
         ),
         complexity_class=complexity,
         reason_codes=codes,
@@ -841,6 +999,111 @@ def build_escalation_chain(decision: RouteDecision, config: Any) -> List[Dict[st
         return []
 
 
+def _plan_from_decision(decision: RouteDecision) -> RouteApplicationPlan:
+    """The applying-plan shape for a usable decision."""
+    return RouteApplicationPlan(
+        model=_clean_str(decision.model),
+        provider=_clean_str(decision.provider),
+        reasoning_effort=_clean_str(decision.reasoning_effort),
+        tier=_clean_str(decision.tier),
+        should_apply=True,
+        decision=decision,
+    )
+
+
+def _denied_plan(decision: RouteDecision, code: str) -> RouteApplicationPlan:
+    """Keep the surface's own route, but say *why* it was kept.
+
+    The returned plan carries no provider/model — ``should_apply`` is false —
+    while still exposing ``decision`` (with the gate's reason code) so callers
+    can record a non-applied observation. That is what makes expansion
+    evidence-driven: a denied surface is visible instead of silently inert.
+    """
+    annotated = replace(
+        decision,
+        reason_codes=_dedupe((code,) + tuple(decision.reason_codes)),
+        applied=False,
+    )
+    return RouteApplicationPlan(
+        model="",
+        provider="",
+        reasoning_effort="",
+        tier="",
+        should_apply=False,
+        decision=annotated,
+    )
+
+
+def _budget_remaining(
+    counts: Dict[str, Any], tier: str, caps: Dict[str, int]
+) -> Optional[int]:
+    """Applies still available for ``tier`` today; ``None`` means uncapped."""
+    cap = caps.get(tier)
+    if cap is None:
+        return None
+    try:
+        used = int(counts.get(tier, 0))
+    except (TypeError, ValueError):
+        used = 0
+    return max(0, cap - used)
+
+
+def _budget_gate(
+    plan: RouteApplicationPlan,
+    decision: RouteDecision,
+    cfg: Dict[str, Any],
+    budget_state: Any,
+) -> RouteApplicationPlan:
+    """Downgrade or deny a route whose tier has spent today's budget.
+
+    The ladder is walked *downwards* only: a spent budget may never promote a
+    route. A vision tier is never downgraded to a text model — the image would
+    silently stop being read — so it is denied instead.
+    """
+    caps = cfg.get("budget") or {}
+    if not caps or not isinstance(budget_state, dict):
+        return plan
+    raw_counts = budget_state.get("counts")
+    counts: Dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+    tier = _clean_str(decision.tier)
+    if tier not in TIER_ORDER:
+        return plan
+    remaining = _budget_remaining(counts, tier, caps)
+    if remaining is None or remaining > 0:
+        return plan
+    if tier == "multimodal":
+        return _denied_plan(decision, _BUDGET_EXHAUSTED)
+    forbidden = tuple((cfg.get("data_policy") or {}).get("forbidden_tiers") or ())
+    for candidate in reversed(TIER_ORDER[: TIER_ORDER.index(tier)]):
+        if candidate in forbidden or candidate == "multimodal":
+            continue
+        entry = _first_entry(cfg["tiers"], candidate)
+        if entry is None:
+            continue
+        cheaper = _budget_remaining(counts, candidate, caps)
+        if cheaper is not None and cheaper <= 0:
+            continue
+        downgraded = replace(
+            decision,
+            tier=candidate,
+            provider=entry["provider"],
+            model=entry["model"],
+            reasoning_effort=entry["reasoning_effort"],
+            escalation_chain=_escalation_pairs(
+                candidate,
+                entry["provider"],
+                entry["model"],
+                cfg["tiers"],
+                cfg["max_escalations"],
+                requires_vision=False,
+                excluded=forbidden,
+            ),
+            reason_codes=_dedupe((_BUDGET_DOWNGRADE,) + tuple(decision.reason_codes)),
+        )
+        return _plan_from_decision(downgraded)
+    return _denied_plan(decision, _BUDGET_EXHAUSTED)
+
+
 def plan_route_application(
     *,
     message: Any,
@@ -851,12 +1114,20 @@ def plan_route_application(
     has_history: bool,
     session_is_new: bool = True,
     has_images: bool = False,
+    surface: Any = "",
+    budget_state: Any = None,
 ) -> RouteApplicationPlan:
     """Return a deterministic first-turn candidate or the original route.
 
     This helper is deliberately pure: it does not resolve credentials, write
     telemetry, mutate session state, or construct/switch an agent. CLI and
     gateway adapters validate the candidate runtime before applying it.
+
+    Phase 3 routes every application through explicit gates: ``surface`` must be
+    enabled in ``agent.adaptive_routing.surfaces`` (default: only ``cli`` and
+    ``gateway``) and the target tier must still have daily budget left. A denied
+    gate returns a non-applying plan that still carries the decision, so the
+    caller can record *why* nothing changed.
     """
     original_model = _clean_str(current_model)
     original_provider = ""
@@ -894,16 +1165,69 @@ def plan_route_application(
         model = _clean_str(decision.model)
         if not provider or not model or decision.pinned:
             return original
-        return RouteApplicationPlan(
-            model=model,
-            provider=provider,
-            reasoning_effort=_clean_str(decision.reasoning_effort),
-            tier=_clean_str(decision.tier),
-            should_apply=True,
-            decision=decision,
-        )
+        surface_name = _clean_str(surface).lower()
+        if not bool((cfg.get("surfaces") or {}).get(surface_name, False)):
+            return _denied_plan(decision, _SURFACE_NOT_ALLOWED)
+        return _budget_gate(_plan_from_decision(decision), decision, cfg, budget_state)
     except Exception:
         return original
+
+
+def load_budget_state(
+    *,
+    config: Any = None,
+    home: Any = None,
+    now: Any = None,
+) -> Dict[str, Any]:
+    """Count *today's applied routes* per tier from the routing log.
+
+    Append-only telemetry is the cheapest honest ledger: no new file, no new
+    write path, and the counter can never claim a route that was not recorded
+    as applied. Only the newest ``_BUDGET_READ_BYTES`` of the log are read, so
+    the cost stays constant as the file grows. Returns
+    ``{"date": "YYYY-MM-DD", "counts": {tier: n}}`` and never raises.
+    """
+    empty: Dict[str, Any] = {"date": "", "counts": {}}
+    try:
+        moment = float(now) if now is not None else time.time()
+        local = time.localtime(moment)
+        day_start = time.mktime(
+            (local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1)
+        )
+        root = Path(home) if home is not None else _resolve_home()
+        if root is None:
+            return empty
+        path = root / SHADOW_LOG_NAME
+        if not path.is_file():
+            return empty
+        counts: Dict[str, int] = {}
+        size = path.stat().st_size
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            if size > _BUDGET_READ_BYTES:
+                handle.seek(size - _BUDGET_READ_BYTES)
+                handle.readline()  # drop the truncated first line
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(record, dict) or record.get("applied") is not True:
+                    continue
+                try:
+                    recorded_at = float(record.get("ts"))
+                except (TypeError, ValueError):
+                    continue
+                if recorded_at < day_start:
+                    continue
+                tier = _clean_str(record.get("tier"))
+                if tier:
+                    counts[tier] = counts.get(tier, 0) + 1
+        return {"date": time.strftime("%Y-%m-%d", local), "counts": counts}
+    except Exception:
+        return empty
 
 
 # ── first-turn gate ──────────────────────────────────────────────────────────
@@ -1025,6 +1349,7 @@ def record_shadow_decision(
     session_id: Any = "",
     platform: Any = "",
     applied: bool = False,
+    surface: Any = "",
     home: Any = None,
 ) -> Optional[str]:
     """Append exactly one bounded JSON line describing a shadow decision.
@@ -1073,6 +1398,7 @@ def record_shadow_decision(
             "effective_provider": _bounded(effective_provider, 64),
             "effective_model": _bounded(effective_model, 128),
             "applied": bool(applied),
+            "surface": _bounded(surface, 32),
             "matched": bool(
                 provider
                 and model

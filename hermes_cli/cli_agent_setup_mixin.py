@@ -318,6 +318,7 @@ class CLIAgentSetupMixin:
                 plan_route_application,
                 record_shadow_decision,
                 message_has_images,
+                load_budget_state,
                 session_ref,
             )
             record_routing_decision = record_shadow_decision
@@ -346,6 +347,10 @@ class CLIAgentSetupMixin:
                     and not bool(getattr(self, "_adaptive_route_owned", False))
                 ),
                 has_images=bool(has_images) or message_has_images(user_message),
+                # Phase 3 gates: the CLI is on the apply allowlist by default
+                # and the target tier needs daily budget left.
+                surface="cli",
+                budget_state=load_budget_state(config=getattr(self, "config", {}) or {}),
             )
             if plan.should_apply:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -396,6 +401,18 @@ class CLIAgentSetupMixin:
                     session_id=session_ref(getattr(self, "session_id", "")),
                     platform="cli",
                     applied=True,
+                    surface="cli",
+                )
+            elif plan is not None and plan.decision is not None:
+                # A Phase 3 gate kept the CLI's own route; record why.
+                record_shadow_decision(
+                    plan.decision,
+                    effective_provider=str(getattr(self, "provider", "") or ""),
+                    effective_model=str(getattr(self, "model", "") or ""),
+                    session_id=session_ref(getattr(self, "session_id", "")),
+                    platform="cli",
+                    applied=False,
+                    surface="cli",
                 )
         except Exception:
             # Routing is optional. Any malformed route or credential failure

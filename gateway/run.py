@@ -7323,6 +7323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plan_route_application,
                 record_shadow_decision,
                 message_has_images,
+                load_budget_state,
                 session_ref,
             )
             record_routing_decision = record_shadow_decision
@@ -7374,6 +7375,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     has_history=bool(has_history),
                     session_is_new=not bool(existing_override),
                     has_images=bool(has_images) or message_has_images(user_message),
+                    # Phase 3 gates: this surface must be on the apply
+                    # allowlist, and the tier must still have daily budget.
+                    surface="gateway",
+                    budget_state=load_budget_state(config=user_config or {}),
                 )
             if plan is not None and plan.should_apply and session_key:
                 candidate = dict(
@@ -7444,6 +7449,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=routing_session_ref,
                     platform=platform_value,
                     applied=True,
+                    surface="gateway",
+                )
+            elif plan is not None and plan.decision is not None:
+                # A Phase 3 gate (surface allowlist or daily budget) kept the
+                # original route. Record the decision as a non-applied
+                # observation so expansion stays evidence-driven instead of
+                # silently inert. No credential is touched here.
+                record_shadow_decision(
+                    plan.decision,
+                    effective_provider=str(runtime.get("provider") or ""),
+                    effective_model=model,
+                    session_id=routing_session_ref,
+                    platform=platform_value,
+                    applied=False,
+                    surface="gateway",
                 )
         except Exception:
             # Optional routing must never make a working gateway route fail.
