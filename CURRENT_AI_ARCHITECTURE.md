@@ -191,6 +191,16 @@ Depois de avaliação, habilitar somente para novas sessões e superfícies sele
 
 Adicionar allowlists por capacidade, budgets e política de dados; testar CLI, gateway, TUI, cron, delegação e auxiliares com `HERMES_HOME` temporário e imports reais. Medir invariantes: alternância de mensagens, cache do prefixo, billing attribution, isolamento de sessão e restauração de fallback.
 
+### Harness de evidência para o classificador (Jev) — 23/09/2026
+
+`agent/jev_router_shadow.py` (opt-in, inerte por default, 16 testes, commit `3172a87b13`): compara o
+tier escolhido pela heurística com um `choice` tipado do **Jev** (TypeSafe System One via OpenRouter,
+`/api/alpha/decisions`) para a mesma primeira mensagem, em thread daemon, gravando só campos enumerados
+(tier, confiança, latência, custo, **comprimento** da mensagem, concordância) em
+`jev_router_shadow.jsonl`. Não muda rota, não escreve texto do usuário, nunca levanta. Ligar é uma linha
+(`agent.adaptive_routing.jev_shadow.enabled: true`) **depois** de decidir a política de dados — a mensagem
+passa a ser enviada à TypeSafe. Custo medido: US$ 0,00002 e ~650 ms por comparação.
+
 ### Fase 4 — otimização baseada em evidência
 
 Só após dados suficientes considerar políticas de custo/latência mais agressivas, mantendo decisão sticky, configuração declarativa e rollback por sessão. Qualidade subjetiva não deve virar fallback implícito sem uma especificação e avaliação separadas.
