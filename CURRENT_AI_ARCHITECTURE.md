@@ -203,6 +203,14 @@ passa a ser enviada à TypeSafe. Custo medido: US$ 0,00002 e ~650 ms por compara
 
 ### Fase 4 — otimização baseada em evidência
 
+**Proxy de qualidade e "custo por sucesso": ver `HAIR-FASE4-QUALIDADE.md` (23/09/2026,
+vigente).** É o artefato que faltava: sem ele a fase mede custo, mas não pode
+autorizar política mais agressiva. Traz os proxies P1–P6 medíveis do `state.db`,
+a baseline de 7 dias, a regra de promoção (n≥30 sessões/braço, P1 +1 p.p. máx.,
+P3 +20% máx., P2=0, P5 tem de cair) e o achado de que o tier `local` ainda **não
+tem uma única chamada de tool** registrada — ou seja, não há evidência de trabalho
+real no tier econômico.
+
 Só após dados suficientes considerar políticas de custo/latência mais agressivas, mantendo decisão sticky, configuração declarativa e rollback por sessão. Qualidade subjetiva não deve virar fallback implícito sem uma especificação e avaliação separadas.
 
 ## 8. Rollback e shadow mode
