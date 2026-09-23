@@ -192,14 +192,13 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
-        # Phase 1 of the opt-in adaptive router: SHADOW ONLY. When enabled, the
-        # first turn of a session is classified with a pure, deterministic
-        # heuristic (no LLM call) and the tier a router *would* have chosen is
-        # appended to <HERMES_HOME>/adaptive_routing_shadow.jsonl next to the
-        # provider/model actually in use. Nothing is applied: the effective
-        # model never changes in this phase, and with ``enabled: false`` (the
-        # default) the whole feature is inert — no file, no log line, no extra
-        # work beyond one cached-config read.
+        # Opt-in adaptive routing. ``enabled`` alone remains the Phase 1
+        # observer: the deterministic first-turn choice is recorded without
+        # changing the route. Phase 2 application additionally requires
+        # ``apply_routes: true`` and ``shadow_mode: false``. CLI and messaging
+        # gateway surfaces then resolve the chosen provider and construct the
+        # first agent directly on it; later turns stay sticky. The defaults
+        # keep the feature fully inert.
         #
         # ``tiers`` maps the ordered ladder (local → free → workhorse →
         # multimodal → premium → frontier) onto the provider/model pairs THIS
@@ -219,6 +218,9 @@ DEFAULT_CONFIG = {
         # the suggested escalation chain.
         "adaptive_routing": {
             "enabled": False,
+            # Separate execution gate. ``enabled: true`` with this false stays
+            # observe-only; routes apply only when shadow_mode is also false.
+            "apply_routes": False,
             "shadow_mode": True,
             "mode": "balanced",
             "max_escalations": 2,

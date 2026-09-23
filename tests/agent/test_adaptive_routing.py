@@ -706,6 +706,7 @@ def test_record_shadow_decision_writes_one_bounded_line_and_no_user_text(tmp_pat
         "escalation_chain",
         "effective_provider",
         "effective_model",
+        "applied",
         "matched",
         "router_version",
     }
@@ -725,6 +726,7 @@ def test_record_shadow_decision_writes_one_bounded_line_and_no_user_text(tmp_pat
     ]
     assert record["effective_provider"] == "openrouter"
     assert record["effective_model"] == "test/model"
+    assert record["applied"] is False
     assert record["matched"] is False  # shadow choice != effective model
     assert record["router_version"] == ar.ROUTER_VERSION
 
@@ -982,6 +984,7 @@ def test_default_config_ships_the_adaptive_routing_block_disabled():
 
     section = DEFAULT_CONFIG["agent"]["adaptive_routing"]
     assert section["enabled"] is False
+    assert section["apply_routes"] is False
     assert section["shadow_mode"] is True
     assert section["mode"] == "balanced"
     assert section["max_escalations"] == 2

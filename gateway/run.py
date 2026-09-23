@@ -2664,16 +2664,42 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str, *, target_model: Optional[str] = None
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        _get_model_config,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            target_model=target_model,
+        )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    # Mirror _resolve_runtime_agent_kwargs(): an explicit HERMES_MAX_TOKENS or
+    # model.max_tokens must survive a provider/route switch, otherwise a routed
+    # turn silently loses the operator's output cap.
+    max_tokens: Optional[int] = None
+    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
+    if _env_mt:
+        try:
+            max_tokens = int(_env_mt)
+        except (ValueError, TypeError):
+            max_tokens = None
+    elif isinstance(_get_model_config(), dict):
+        mt = _get_model_config().get("max_tokens")
+        if isinstance(mt, int):
+            max_tokens = mt
+    if max_tokens is None:
+        _runtime_mot = runtime.get("max_output_tokens")
+        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
+            max_tokens = _runtime_mot
+
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -2683,6 +2709,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": max_tokens,
     }
 
 
@@ -4748,7 +4775,15 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        turn_route = self._runner._resolve_turn_agent_config(
+            ctx.message,
+            model,
+            runtime_kwargs,
+            session_key=ctx.session_key,
+            user_config=ctx.user_config,
+            has_history=bool(ctx.history),
+            source=ctx.source,
+        )
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -7230,7 +7265,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+        has_history: bool = False,
+        source: Optional[SessionSource] = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -7251,6 +7296,152 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+
+        # HAIR Phase 2 is a pre-construction decision. Existing session
+        # overrides (including /model), channel pins, resumed transcripts and
+        # request-oriented gateway surfaces all win. The target provider is
+        # resolved before the cache signature is computed; failures retain the
+        # original complete runtime.
+        plan = None
+        platform_value = ""
+        record_routing_decision = None
+        routing_session_ref = ""
+        try:
+            from agent.adaptive_routing import (
+                plan_route_application,
+                record_shadow_decision,
+                session_ref,
+            )
+            record_routing_decision = record_shadow_decision
+            # The routing log must never receive a durable chat/user id;
+            # chat keys embed platform:chat_id:user_id.
+            routing_session_ref = session_ref(session_key or "")
+
+            existing_override = None
+            if session_key:
+                overrides = getattr(self, "_session_model_overrides", {})
+                if callable(getattr(overrides, "get", None)):
+                    existing_override = overrides.get(session_key)
+
+            platform = getattr(source, "platform", None)
+            platform_value = getattr(platform, "value", str(platform or ""))
+            skip_surface = platform_value in {"api_server", "local", "webhook"}
+
+            channel_pin = False
+            if source is not None:
+                try:
+                    ch = _get_channel_override(
+                        getattr(self, "config", None),
+                        source.platform,
+                        str(source.chat_id or ""),
+                        thread_id=(
+                            str(source.thread_id)
+                            if getattr(source, "thread_id", None)
+                            else None
+                        ),
+                        parent_id=(
+                            str(source.parent_chat_id)
+                            if getattr(source, "parent_chat_id", None)
+                            else None
+                        ),
+                    )
+                    channel_pin = bool(ch and (ch.model or ch.provider))
+                except Exception:
+                    channel_pin = True
+
+            plan = plan_route_application(
+                message=user_message,
+                current_model=model,
+                current_runtime=runtime,
+                config=user_config or {},
+                explicit_pin=bool(existing_override or channel_pin or skip_surface),
+                has_history=bool(has_history),
+                session_is_new=not bool(existing_override),
+            )
+            if plan.should_apply and session_key:
+                candidate = dict(
+                    _resolve_runtime_agent_kwargs_for_provider(
+                        plan.provider,
+                        target_model=plan.model,
+                    ) or {}
+                )
+                candidate.pop("model", None)
+                candidate_provider = str(candidate.get("provider") or "").strip()
+                candidate_base_url = candidate.get("base_url")
+                candidate_command = candidate.get("command")
+                candidate_key = candidate.get("api_key")
+                if not candidate_provider or not plan.model:
+                    raise RuntimeError("adaptive route is incomplete")
+                if not candidate_base_url and not candidate_command:
+                    raise RuntimeError("adaptive runtime has no endpoint")
+                if not candidate_key and not candidate_command:
+                    raise RuntimeError("adaptive runtime has no credentials")
+                candidate["requested_provider"] = plan.provider
+                candidate["args"] = list(candidate.get("args") or [])
+
+                override = {
+                    "model": plan.model,
+                    "provider": candidate_provider,
+                    "api_key": candidate.get("api_key"),
+                    "base_url": candidate_base_url,
+                    "api_mode": candidate.get("api_mode"),
+                    "credential_pool": candidate.get("credential_pool"),
+                    "adaptive_router": True,
+                }
+                self._session_model_overrides[session_key] = override
+                persisted = {
+                    "model": plan.model,
+                    "provider": candidate_provider,
+                    "base_url": candidate_base_url,
+                    "adaptive_router": True,
+                }
+                store = getattr(self, "session_store", None)
+                if store is not None:
+                    try:
+                        store.set_model_override(session_key, persisted)
+                    except Exception:
+                        # Keep the coherent in-process sticky route even when
+                        # the non-secret persistence store is temporarily
+                        # unavailable. No credential is included in this log.
+                        logger.debug(
+                            "Adaptive route persistence failed for session=%s",
+                            session_key,
+                            exc_info=True,
+                        )
+                model = plan.model
+                runtime = {
+                    "api_key": candidate.get("api_key"),
+                    "base_url": candidate_base_url,
+                    "provider": candidate_provider,
+                    "requested_provider": plan.provider,
+                    "api_mode": candidate.get("api_mode"),
+                    "command": candidate_command,
+                    "args": list(candidate.get("args") or []),
+                    "credential_pool": candidate.get("credential_pool"),
+                    "max_tokens": candidate.get("max_tokens"),
+                }
+                record_shadow_decision(
+                    plan.decision,
+                    effective_provider=candidate_provider,
+                    effective_model=plan.model,
+                    session_id=routing_session_ref,
+                    platform=platform_value,
+                    applied=True,
+                )
+        except Exception:
+            # Optional routing must never make a working gateway route fail.
+            if plan is not None and plan.decision is not None and callable(
+                record_routing_decision
+            ):
+                record_routing_decision(
+                    plan.decision,
+                    effective_provider=runtime.get("provider"),
+                    effective_model=model,
+                    session_id=routing_session_ref,
+                    platform=platform_value if source is not None else "",
+                    applied=False,
+                )
+
         route = {
             "model": model,
             "runtime": runtime,
@@ -23647,6 +23838,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
         }
+        if str(persisted.get("adaptive_router") or "").strip().lower() == "true":
+            override["adaptive_router"] = True
         provider = persisted.get("provider")
         if provider:
             # Re-resolve credentials for the persisted provider. On failure
@@ -23654,7 +23847,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # credential-less override — _resolve_session_agent_runtime falls
             # back to env-based resolution and applies model/provider on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                # Pass the persisted model so provider-specific api_mode /
+                # base_url resolution matches the model actually in use, not
+                # the config default (matters for OpenCode Zen/Go-style
+                # providers that pick their wire protocol per model).
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    provider, target_model=persisted.get("model")
+                )
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
@@ -23687,6 +23886,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override = _apply_state.conversation.model_override if _apply_state else None
         if not override:
             return model, runtime_kwargs
+        if override.get("adaptive_router") is True or str(
+            override.get("adaptive_router") or ""
+        ).strip().lower() == "true":
+            try:
+                from agent.adaptive_routing import load_adaptive_config
+
+                adaptive = load_adaptive_config()
+                active = bool(
+                    adaptive.get("enabled")
+                    and adaptive.get("apply_routes")
+                    and not adaptive.get("shadow_mode")
+                )
+            except Exception:
+                # Config read failure is not evidence that the operator turned
+                # routing off. Keep the current sticky route and fail open.
+                active = True
+            if not active:
+                _apply_state.conversation.model_override = None
+                try:
+                    self.session_store.set_model_override(session_key, None)
+                except Exception:
+                    logger.debug(
+                        "Failed to clear disabled adaptive route for session=%s",
+                        session_key,
+                        exc_info=True,
+                    )
+                return model, runtime_kwargs
         model = override.get("model", model)
         for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
             val = override.get(key)

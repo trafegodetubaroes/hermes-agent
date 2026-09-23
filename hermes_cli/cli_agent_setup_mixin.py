@@ -304,6 +304,102 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+
+        # HAIR Phase 2 selects only before the first AIAgent construction.
+        # The pure planner cannot touch credentials; resolve the configured
+        # target here and commit it to the CLI object's session state only
+        # after a complete, usable runtime has been obtained.
+        plan = None
+        record_routing_decision = None
+        try:
+            from agent.adaptive_routing import (
+                plan_route_application,
+                record_shadow_decision,
+            )
+            record_routing_decision = record_shadow_decision
+
+            plan = plan_route_application(
+                message=user_message,
+                current_model=self.model,
+                current_runtime=runtime,
+                config=getattr(self, "config", {}),
+                # Process-level --model/--provider flags and an interactive
+                # /model choice in this session both win over the router.
+                explicit_pin=bool(
+                    getattr(self, "_startup_route_explicit", False)
+                    or getattr(self, "_session_route_explicit", False)
+                ),
+                has_history=bool(getattr(self, "conversation_history", None)),
+                session_is_new=(
+                    not bool(getattr(self, "_resumed", False))
+                    and not bool(getattr(self, "_adaptive_route_owned", False))
+                ),
+            )
+            if plan.should_apply:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved = resolve_runtime_provider(
+                    requested=plan.provider,
+                    target_model=plan.model,
+                )
+                if not isinstance(resolved, dict):
+                    raise RuntimeError("adaptive provider returned no runtime")
+                candidate = {
+                    "api_key": resolved.get("api_key"),
+                    "base_url": resolved.get("base_url"),
+                    "provider": resolved.get("provider"),
+                    "requested_provider": plan.provider,
+                    "api_mode": resolved.get("api_mode"),
+                    "command": resolved.get("command"),
+                    "args": list(resolved.get("args") or []),
+                    "credential_pool": resolved.get("credential_pool"),
+                }
+                candidate_provider = str(candidate.get("provider") or "").strip()
+                candidate_base_url = candidate.get("base_url")
+                candidate_command = candidate.get("command")
+                candidate_key = candidate.get("api_key")
+                if not candidate_provider or not plan.model:
+                    raise RuntimeError("adaptive route is incomplete")
+                if not candidate_base_url and not candidate_command:
+                    raise RuntimeError("adaptive runtime has no endpoint")
+                if not candidate_key and not candidate_command:
+                    raise RuntimeError("adaptive runtime has no credentials")
+
+                self.model = plan.model
+                self.requested_provider = plan.provider
+                self.provider = candidate_provider
+                self.api_key = candidate.get("api_key")
+                self.base_url = candidate_base_url
+                self.api_mode = candidate.get("api_mode")
+                self.acp_command = candidate_command
+                self.acp_args = list(candidate.get("args") or [])
+                self._credential_pool = candidate.get("credential_pool")
+                self._provider_source = resolved.get("source")
+                self._adaptive_route_owned = True
+                runtime = candidate
+                record_shadow_decision(
+                    plan.decision,
+                    effective_provider=candidate_provider,
+                    effective_model=plan.model,
+                    session_id=getattr(self, "session_id", ""),
+                    platform="cli",
+                    applied=True,
+                )
+        except Exception:
+            # Routing is optional. Any malformed route or credential failure
+            # keeps the already-resolved original runtime intact.
+            if plan is not None and plan.decision is not None and callable(
+                record_routing_decision
+            ):
+                record_routing_decision(
+                    plan.decision,
+                    effective_provider=runtime.get("provider"),
+                    effective_model=self.model,
+                    session_id=getattr(self, "session_id", ""),
+                    platform="cli",
+                    applied=False,
+                )
+
         route = {
             "model": self.model,
             "runtime": runtime,

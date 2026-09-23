@@ -1,12 +1,11 @@
-"""Phase 1 *shadow* adaptive routing — pure, deterministic, opt-in.
+"""HAIR adaptive routing — pure decisions with surface-owned application.
 
 This module answers one question per first turn: *"which tier would a router
 have picked for this message?"* — and records the answer next to the provider
-and model that were actually used. It is a **measurement**, not a control
-path:
+and model that were actually used. Phase 1 remains an observe-only mode;
+Phase 2 lets CLI and gateway surfaces apply the route before construction:
 
-* it never changes the agent's effective provider/model (``applied`` is
-  always False in Phase 1);
+* this module never switches a live agent or resolves credentials;
 * it makes **zero** LLM/provider calls — classification is a pure heuristic
   over the message text (bilingual PT-BR + EN);
 * it is opt-in and inert by default (``agent.adaptive_routing.enabled`` is
@@ -24,9 +23,8 @@ Design constraints encoded here:
   real* (an existing configured tier) or to an explicitly empty route — never
   to a half-empty provider/model pair.
 
-Phase 1 deliberately exposes :func:`build_escalation_chain` for tests and for
-Phase 2, but does **not** wire it into any fallback mechanism: escalation stays
-a suggestion in the shadow log.
+Escalation chains remain suggestions and are not wired into the runtime
+fallback mechanism.
 """
 
 from __future__ import annotations
@@ -37,6 +35,7 @@ import os
 import re
 import time
 import unicodedata
+from hashlib import sha256
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -66,7 +65,7 @@ MODES: Tuple[str, ...] = ("economy", "balanced", "quality", "maximum")
 
 #: Bumped whenever the classifier/route heuristics change, so shadow logs from
 #: different generations stay distinguishable.
-ROUTER_VERSION = "phase1-shadow-1"
+ROUTER_VERSION = "phase2-prebuild-1"
 
 #: One JSON line per observation, appended under HERMES_HOME.
 SHADOW_LOG_NAME = "adaptive_routing_shadow.jsonl"
@@ -90,6 +89,10 @@ _DEFAULT_EFFORT_BY_TIER: Dict[str, str] = {
 }
 
 _VALID_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+
+# Explicit privacy contracts the router understands. ``local_only`` pins the
+# local tier so no prompt content can leave the machine.
+PRIVACY_VALUES = frozenset({"normal", "local_only"})
 
 _EXPLICIT_PIN = "explicit_pin"
 _PRIVACY_LOCAL_ONLY = "privacy_local_only"
@@ -249,6 +252,7 @@ _SHADOW_JSON_FIELDS: Tuple[str, ...] = (
     "escalation_chain",
     "effective_provider",
     "effective_model",
+    "applied",
     "matched",
     "router_version",
 )
@@ -282,6 +286,18 @@ class RouteDecision:
     pinned: bool
     shadow: bool
     applied: bool
+
+
+@dataclass(frozen=True)
+class RouteApplicationPlan:
+    """Pure pre-construction plan; surfaces own credential resolution."""
+
+    model: str
+    provider: str
+    reasoning_effort: str
+    tier: str
+    should_apply: bool
+    decision: Optional[RouteDecision]
 
 
 # ── small pure helpers ───────────────────────────────────────────────────────
@@ -514,15 +530,22 @@ def _normalise_section(section: Any) -> Dict[str, Any]:
     if not isinstance(section, dict):
         section = {}
     enabled = section.get("enabled")
+    apply_routes = section.get("apply_routes")
     shadow_mode = section.get("shadow_mode")
     mode = section.get("mode")
+    privacy = section.get("privacy")
     normalised_mode = mode.strip().lower() if isinstance(mode, str) else ""
     if normalised_mode not in MODES:
         normalised_mode = "balanced"
+    normalised_privacy = privacy.strip().lower() if isinstance(privacy, str) else ""
+    if normalised_privacy not in PRIVACY_VALUES:
+        normalised_privacy = "normal"
     return {
         "enabled": enabled if isinstance(enabled, bool) else False,
+        "apply_routes": apply_routes if isinstance(apply_routes, bool) else False,
         "shadow_mode": shadow_mode if isinstance(shadow_mode, bool) else True,
         "mode": normalised_mode,
+        "privacy": normalised_privacy,
         "max_escalations": _normalise_max_escalations(section.get("max_escalations")),
         "tiers": _normalise_tiers(section.get("tiers")),
     }
@@ -818,6 +841,71 @@ def build_escalation_chain(decision: RouteDecision, config: Any) -> List[Dict[st
         return []
 
 
+def plan_route_application(
+    *,
+    message: Any,
+    current_model: Any,
+    current_runtime: Any,
+    config: Any,
+    explicit_pin: bool,
+    has_history: bool,
+    session_is_new: bool = True,
+    has_images: bool = False,
+) -> RouteApplicationPlan:
+    """Return a deterministic first-turn candidate or the original route.
+
+    This helper is deliberately pure: it does not resolve credentials, write
+    telemetry, mutate session state, or construct/switch an agent. CLI and
+    gateway adapters validate the candidate runtime before applying it.
+    """
+    original_model = _clean_str(current_model)
+    original_provider = ""
+    if isinstance(current_runtime, dict):
+        original_provider = _clean_str(current_runtime.get("provider"))
+    original = RouteApplicationPlan(
+        model=original_model,
+        provider=original_provider,
+        reasoning_effort="",
+        tier="",
+        should_apply=False,
+        decision=None,
+    )
+    try:
+        cfg = load_adaptive_config(config)
+        active = (
+            cfg["enabled"]
+            and cfg["apply_routes"]
+            and not cfg["shadow_mode"]
+        )
+        if (
+            not active
+            or bool(explicit_pin)
+            or bool(has_history)
+            or not bool(session_is_new)
+        ):
+            return original
+        signals = classify_task(
+            message=message,
+            history_len=0,
+            has_images=bool(has_images),
+        )
+        decision = resolve_route(signals, config=cfg, privacy=cfg.get("privacy"))
+        provider = _clean_str(decision.provider)
+        model = _clean_str(decision.model)
+        if not provider or not model or decision.pinned:
+            return original
+        return RouteApplicationPlan(
+            model=model,
+            provider=provider,
+            reasoning_effort=_clean_str(decision.reasoning_effort),
+            tier=_clean_str(decision.tier),
+            should_apply=True,
+            decision=decision,
+        )
+    except Exception:
+        return original
+
+
 # ── first-turn gate ──────────────────────────────────────────────────────────
 
 
@@ -838,7 +926,8 @@ def should_observe_first_turn(
         cfg = load_adaptive_config(config)
     except Exception:
         return False
-    return bool(cfg["enabled"]) and not bool(has_history)
+    observe_only = bool(cfg["shadow_mode"]) or not bool(cfg["apply_routes"])
+    return bool(cfg["enabled"]) and observe_only and not bool(has_history)
 
 
 # ── telemetry (bounded, enumerated, no user text) ────────────────────────────
@@ -861,6 +950,23 @@ def _resolve_home() -> Optional[Path]:
     return None
 
 
+def session_ref(raw: Any, *, length: int = 12) -> str:
+    """Return a stable, non-reversible reference for a session identifier.
+
+    Gateway chat keys embed platform, chat id and user id. Hashing keeps
+    decisions correlatable across turns without writing a durable chat/user
+    identifier to the routing log.
+    """
+    text = _clean_str(raw)
+    if not text:
+        return ""
+    try:
+        size = max(6, min(int(length), 32))
+    except Exception:
+        size = 12
+    return "s" + sha256(text.encode("utf-8")).hexdigest()[:size]
+
+
 def record_shadow_decision(
     decision: RouteDecision,
     *,
@@ -868,6 +974,7 @@ def record_shadow_decision(
     effective_model: Any = "",
     session_id: Any = "",
     platform: Any = "",
+    applied: bool = False,
     home: Any = None,
 ) -> Optional[str]:
     """Append exactly one bounded JSON line describing a shadow decision.
@@ -876,6 +983,10 @@ def record_shadow_decision(
     and must never be able to break a turn. The record carries enumerated
     fields only: no message text, no prompt, no tool arguments, no URLs, no
     credentials.
+
+    Callers must pass a NON-IDENTIFYING ``session_id``: a gateway chat key
+    embeds ``platform:chat_id:user_id``, so routing surfaces hash it with
+    :func:`session_ref` before recording. The value is bounded to 128 chars.
     """
     try:
         provider = _clean_str(getattr(decision, "provider", ""))
@@ -911,6 +1022,7 @@ def record_shadow_decision(
             "escalation_chain": escalation,
             "effective_provider": _bounded(effective_provider, 64),
             "effective_model": _bounded(effective_model, 128),
+            "applied": bool(applied),
             "matched": bool(
                 provider
                 and model
@@ -950,7 +1062,9 @@ def observe_shadow_route(
     """
     try:
         cfg = load_adaptive_config(config)
-        if not cfg["enabled"]:
+        if not cfg["enabled"] or (
+            cfg["apply_routes"] and not cfg["shadow_mode"]
+        ):
             # Inert path: no classification, no routing, no file, no log line.
             return None
         if not should_observe_first_turn(

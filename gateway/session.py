@@ -753,7 +753,15 @@ def build_session_context_prompt(
 # provider resolution) is intentionally excluded: credentials must NEVER be
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_MODEL_OVERRIDE_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    # Non-secret ownership marker. It lets the gateway roll back only routes
+    # created by HAIR when apply_routes is disabled, without clearing a user's
+    # explicit /model override.
+    "adaptive_router",
+)
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -768,8 +776,14 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     cleaned = {
         k: str(v)
         for k, v in override.items()
-        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
+        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS
+        and k != "adaptive_router"
+        and v not in (None, "")
     }
+    if override.get("adaptive_router") is True or str(
+        override.get("adaptive_router") or ""
+    ).strip().lower() == "true":
+        cleaned["adaptive_router"] = "true"
     return cleaned or None
 
 

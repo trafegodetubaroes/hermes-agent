@@ -2011,7 +2011,30 @@ class CLICommandsMixin:
         _cprint(f"  Task ID: {task_id}")
         _cprint("  You can continue chatting — results will appear when done.\n")
 
-        turn_route = self._resolve_turn_agent_config(prompt)
+        # Classify for the background agent WITHOUT mutating the foreground
+        # session: _resolve_turn_agent_config commits a routed provider/model
+        # onto this shared HermesCLI object, which would hijack the user's
+        # active conversation (and its prompt cache) from a /background task.
+        _route_fields = (
+            "model",
+            "provider",
+            "requested_provider",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "acp_command",
+            "acp_args",
+            "_credential_pool",
+            "_provider_source",
+            "_adaptive_route_owned",
+            "_session_route_explicit",
+        )
+        _route_snapshot = {key: getattr(self, key, None) for key in _route_fields}
+        try:
+            turn_route = self._resolve_turn_agent_config(prompt)
+        finally:
+            for key, value in _route_snapshot.items():
+                setattr(self, key, value)
 
         def run_background():
             set_sudo_password_callback(self._sudo_password_callback)

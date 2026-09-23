@@ -4304,6 +4304,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
         """
+        # Preserve surface intent separately from the resolved provider/model.
+        # Adaptive routing may only act when none of these startup runtime
+        # selectors were supplied explicitly.
+        self._startup_route_explicit = bool(
+            model or provider or api_key or base_url
+        )
+        # Session-scoped counterpart: an interactive /model (or picker) choice
+        # pins the route for the remainder of THIS session only, so /new
+        # releases it. --once never pins (see _handle_model_switch).
+        self._session_route_explicit = False
+        self._adaptive_route_owned = False
+
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
@@ -8477,6 +8489,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self._adaptive_route_owned = False
+        # /new is a full conversation boundary: a session-scoped /model pin
+        # does not carry into the fresh session, and the next first turn may be
+        # routed again. Process-level --model/--provider flags still win.
+        self._session_route_explicit = False
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
@@ -9493,6 +9510,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 return
 
+        # A successful interactive /model selection is an explicit user pin,
+        # including when it happens before the first ordinary user turn. The
+        # adaptive router must never replace it merely because history is
+        # still empty. Session-scoped so /new releases the pin.
+        self._session_route_explicit = True
+        self._adaptive_route_owned = False
+
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
         _display_new = format_model_for_display(result.new_model)
@@ -9852,6 +9876,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._pending_one_turn_model_restore = _one_turn_restore_snapshot
         else:
             self._pending_one_turn_model_restore = None
+
+        # A durable /model choice is an explicit pin for this session; a
+        # --once switch must not disable routing beyond its single turn.
+        if not one_turn:
+            self._session_route_explicit = True
+            self._adaptive_route_owned = False
 
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
