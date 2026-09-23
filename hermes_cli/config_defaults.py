@@ -254,6 +254,18 @@ DEFAULT_CONFIG = {
                 "local_only_classes": [],
                 "forbidden_tiers": [],
             },
+            # OPT-IN evidence harness (off by default): compares the heuristic
+            # classifier with a typed decision from Jev (TypeSafe's System One
+            # model, served through OpenRouter) for the same first-turn message.
+            # It NEVER changes the route and runs in a daemon thread, logging
+            # enumerated fields only (tier, confidence, latency, cost, message
+            # length — never the message text). Enable it only after deciding the
+            # data policy: the message IS sent to TypeSafe when enabled.
+            "jev_shadow": {
+                "enabled": False,
+                "model": "~typesafe/jev-latest",
+                "timeout_s": 20,
+            },
             "tiers": {
                 "local": [],
                 "free": [],

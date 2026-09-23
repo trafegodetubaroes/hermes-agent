@@ -535,12 +535,31 @@ def build_turn_context(
                 ).strip().lower() in ("image", "image_url", "input_image"):
                     _shadow_has_images = True
                     break
-        observe_shadow_route(
+        _shadow_decision = observe_shadow_route(
             agent=agent,
             user_message=user_message,
             conversation_history=conversation_history,
             has_images=_shadow_has_images,
         )
+
+        # Jev shadow (OPT-IN, inert by default): compares the heuristic's tier
+        # with a typed decision from Jev (TypeSafe, via OpenRouter) for the same
+        # message. Runs in a daemon thread so a slow provider can never delay
+        # the turn, and records enumerated fields only — never the message text.
+        # It does nothing unless agent.adaptive_routing.jev_shadow.enabled is
+        # true, and the message IS sent to TypeSafe when it is: that is the
+        # owner's data-policy call, not a default.
+        try:
+            from agent.jev_router_shadow import spawn_jev_shadow
+
+            spawn_jev_shadow(
+                message=user_message if isinstance(user_message, str) else "",
+                platform=getattr(agent, "platform", ""),
+                heuristic_tier=getattr(_shadow_decision, "tier", "") if _shadow_decision else "",
+                session_id=getattr(agent, "session_id", ""),
+            )
+        except Exception:
+            logger.debug("jev router shadow skipped", exc_info=True)
     except Exception:
         logger.debug("adaptive routing shadow observer skipped", exc_info=True)
 
