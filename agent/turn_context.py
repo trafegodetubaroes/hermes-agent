@@ -498,17 +498,28 @@ def build_turn_context(
     except Exception:
         pass
 
-    # Phase 1 adaptive routing: SHADOW-ONLY first-turn observer. When (and only
-    # when) ``agent.adaptive_routing.enabled`` is true in config.yaml, this
-    # classifies THIS first turn's message with a pure deterministic heuristic
-    # and appends what a router *would* have chosen to
+    # Adaptive routing observer: the shared per-turn prologue, shared by EVERY
+    # surface (CLI, gateway, TUI, cron, subagents). When (and only when)
+    # ``agent.adaptive_routing.enabled`` is true in config.yaml, this classifies
+    # THIS first turn's message with a pure deterministic heuristic and appends
+    # what a router *would* have chosen to
     # <HERMES_HOME>/adaptive_routing_shadow.jsonl, next to the provider/model
     # that are actually in use. It deliberately changes NOTHING about the turn:
-    # no model/provider switch, no fallback chain, no LLM call, no extra log
-    # line, and no message/tool/system-prompt mutation. Disabled (the default)
-    # it short-circuits on one cached-config read inside observe_shadow_route,
-    # before any classification or file work. The whole call is wrapped so a
-    # routing *hint* can never break a turn.
+    # no model/provider switch, no fallback chain, no LLM call, no message/
+    # tool/system-prompt mutation.
+    #
+    # Which surfaces are observed is decided per surface inside
+    # observe_shadow_route: while route *application* is live, cli/gateway are
+    # skipped because their own pre-construction appliers record the decision
+    # (applied or denied), and observing them here would double-log the turn;
+    # every other surface — tui, cron, delegation/subagent, unmapped front ends
+    # — keeps recording a non-applied observation (reason code
+    # ``observe_only_surface``), which is the evidence Phase 4 needs from the
+    # surfaces that may not apply a route yet.
+    #
+    # Disabled (the default) it short-circuits on one cached-config read inside
+    # observe_shadow_route, before any classification or file work. The whole
+    # call is wrapped so a routing *hint* can never break a turn.
     try:
         from agent.adaptive_routing import observe_shadow_route
 

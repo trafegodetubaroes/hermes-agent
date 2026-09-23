@@ -153,16 +153,41 @@ Depois de avaliação, habilitar somente para novas sessões e superfícies sele
 ### Fase 3 — expansão controlada
 
 > **Implementada em 2026-09-23** (branch `feature/hair-phase0`, router
-> `phase3-1`, 39 testes novos em `tests/agent/test_adaptive_routing_phase3.py`).
+> `phase3-1` → `phase3-2`, 91 testes novos: 39 em
+> `tests/agent/test_adaptive_routing_phase3.py` e 52 em
+> `tests/agent/test_adaptive_routing_surface_observation.py`).
+>
+> **Ativada no `config.yaml`** (2026-09-23 09:21, backup
+> `config.yaml.bak-20260923-092124`; diff = 25 linhas adicionadas, 0 removidas):
+> `surfaces: {cli: true, gateway: true, tui: false, cron: false,
+> delegation: false}` (só cli/gateway têm call-site de aplicação — ligar as
+> outras seria config sem efeito), `budget: {premium: 10, frontier: 5}`
+> (**disjuntores** contra fuga, não política de economia: o custo real está no
+> workhorse DeepSeek, barato por token, e premium/frontier são assinatura) e
+> `data_policy` **vazio de propósito** (forçar `CRITICAL` ao tier local 4B
+> degradaria exatamente o trabalho mais crítico; privacidade segue no knob
+> global `privacy`).
+>
+> **Correção de observação (phase3-2).** Com a aplicação ativa, o observador do
+> prologue (`agent/turn_context.py` → `observe_shadow_route`) virou inerte para
+> TODAS as superfícies, e cron/delegação/subagente/TUI pararam de ser
+> registrados — era justamente a evidência que a Fase 4 precisa. Agora a
+> decisão é **por superfície**, a partir de uma única allowlist compartilhada
+> (`surface_allowed_to_apply` / `surface_owns_its_telemetry` /
+> `surface_for_platform`, com `_APPLIER_SURFACES = ("cli", "gateway")`): quem
+> aplica registra a própria decisão (aplicada ou negada) e **não** é observado
+> de novo; as demais gravam uma observação `applied=false` com
+> `reason_codes=[observe_only_surface]`.
+>
 > Entregue como gates opt-in em `agent.adaptive_routing`, todos com default que
 > preserva o comportamento da Phase 2 — nada muda até serem ligados:
-> `surfaces` (allowlist de quem pode APLICAR; só cli+gateway por default,
-> fail-closed para superfícies desconhecidas), `budget` (teto diário de rotas
-> aplicadas por tier, contado do próprio log; tier gasto faz o roteador descer
-> a escada, nunca subir) e `data_policy` (`local_only_classes` — classes que
-> não saem da máquina; `forbidden_tiers` — tiers nunca selecionados nem
-> escalados). Um gate negado registra a decisão como `applied=false` com o
-> motivo, para a Phase 4 decidir com evidência em vez de suposição.
+> `surfaces` (allowlist de quem pode APLICAR; fail-closed para superfícies
+> desconhecidas), `budget` (teto diário de rotas aplicadas por tier, contado do
+> próprio log; tier gasto faz o roteador descer a escada, nunca subir) e
+> `data_policy` (`local_only_classes` — classes que não saem da máquina;
+> `forbidden_tiers` — tiers nunca selecionados nem escalados). Um gate negado
+> registra a decisão como `applied=false` com o motivo, para a Phase 4 decidir
+> com evidência em vez de suposição.
 
 Adicionar allowlists por capacidade, budgets e política de dados; testar CLI, gateway, TUI, cron, delegação e auxiliares com `HERMES_HOME` temporário e imports reais. Medir invariantes: alternância de mensagens, cache do prefixo, billing attribution, isolamento de sessão e restauração de fallback.
 

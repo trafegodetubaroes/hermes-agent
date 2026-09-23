@@ -34,6 +34,16 @@ Phase 3 gates (all opt-in, all defaulting to today's behaviour):
 * ``budget`` — per-day cap of applied routes per tier (``0`` blocks a tier);
 * ``data_policy.local_only_classes`` — classes that must stay on the local tier;
 * ``data_policy.forbidden_tiers`` — tiers never selected nor escalated into.
+
+Observation is per surface: while application is live, a surface that owns its
+own telemetry — the two appliers (``cli``/``gateway``, which record both applied
+and denied decisions) and any surface the allowlist authorises to apply — is
+never *also* observed, so one first turn can never produce two log lines. Every
+other surface (``cron``, ``delegation``/``subagent``, ``tui``, an unmapped front
+end) keeps observing, recording a non-applied decision tagged
+``observe_only_surface`` — the evidence the next phase needs from exactly the
+surfaces that may not apply yet. With application off (shadow mode or
+``apply_routes: false``) every surface observes, as in Phase 1.
 """
 
 from __future__ import annotations
@@ -74,7 +84,7 @@ MODES: Tuple[str, ...] = ("economy", "balanced", "quality", "maximum")
 
 #: Bumped whenever the classifier/route heuristics change, so shadow logs from
 #: different generations stay distinguishable.
-ROUTER_VERSION = "phase3-1"
+ROUTER_VERSION = "phase3-2"
 
 #: One JSON line per observation, appended under HERMES_HOME.
 SHADOW_LOG_NAME = "adaptive_routing_shadow.jsonl"
@@ -112,6 +122,24 @@ SURFACES: Tuple[str, ...] = ("cli", "gateway", "tui", "cron", "delegation")
 #: observe-only until switched on explicitly (the Phase 3 allowlist).
 _DEFAULT_SURFACES: Dict[str, bool] = {"cli": True, "gateway": True}
 
+#: Surfaces whose own pre-construction applier writes the routing telemetry:
+#: ``applied=True`` when it applied the route, ``applied=False`` with a gate
+#: reason when a Phase 3 gate denied it. These are exactly the callers of
+#: :func:`plan_route_application` (the CLI turn-config builder and
+#: ``gateway/run.py``), so the shared prologue observer must stay out of them —
+#: otherwise every first turn on those surfaces would be logged twice.
+_APPLIER_SURFACES: Tuple[str, ...] = ("cli", "gateway")
+
+#: ``platform`` values that mean the ``delegation`` surface. The delegation tool
+#: stamps its child agents ``platform="subagent"``, which is not a surface name.
+_DELEGATION_PLATFORMS: Tuple[str, ...] = ("subagent", "subagents", "delegate")
+
+#: Platforms served by the gateway whose turns it never plans a route for
+#: (``gateway/run.py`` treats them as pinned, request-oriented builders and
+#: returns before any decision exists). Nothing else records them, so the shared
+#: observer must keep doing it.
+_GATEWAY_UNPLANNED_PLATFORMS: frozenset = frozenset({"local", "api_server", "webhook"})
+
 #: Bounded tail read for the daily budget counter: telemetry is append-only, so
 #: only the newest bytes can hold today's applied routes.
 _BUDGET_READ_BYTES = 512 * 1024
@@ -136,6 +164,7 @@ _POLICY_TIER_FORBIDDEN = "policy_tier_forbidden"
 _BUDGET_DOWNGRADE = "budget_downgrade"
 _BUDGET_EXHAUSTED = "budget_exhausted"
 _SURFACE_NOT_ALLOWED = "surface_not_allowed"
+_OBSERVE_ONLY_SURFACE = "observe_only_surface"
 
 _TRIVIAL_MAX_CHARS = 120
 _LOW_MAX_CHARS = 320
@@ -659,6 +688,108 @@ def load_adaptive_config(config: Any = None) -> Dict[str, Any]:
     return _normalise_section(_extract_adaptive_section(raw))
 
 
+# ── surfaces: who may apply, who owns the telemetry ──────────────────────────
+
+
+def _application_is_live(cfg: Dict[str, Any]) -> bool:
+    """True when an enabled, non-shadow config changes routes before build."""
+    return bool(cfg.get("apply_routes")) and not bool(cfg.get("shadow_mode"))
+
+
+def surface_allowed_to_apply(config: Any, surface: Any) -> bool:
+    """True when the ``surfaces`` allowlist lets ``surface`` apply a route.
+
+    Single source of truth for the Phase 3 gate: the applier
+    (:func:`plan_route_application`) and the observer must never disagree about
+    which surfaces may change a turn's route. Fail-closed — an unknown surface
+    name, a malformed value or an unreadable config all answer ``False``.
+    """
+    try:
+        cfg = load_adaptive_config(config)
+        name = _clean_str(surface).strip().lower()
+        if name not in SURFACES:
+            return False
+        return bool((cfg.get("surfaces") or {}).get(name, False))
+    except Exception:
+        return False
+
+
+def surface_owns_its_telemetry(config: Any, surface: Any) -> bool:
+    """True when ``surface`` writes its own routing telemetry.
+
+    Two cases, each of which would produce a duplicate log line if the shared
+    prologue observer also recorded the turn:
+
+    * a surface with a pre-construction applier (``cli``/``gateway``) — it
+      records the applied route *and* the denied one, so it owns its telemetry
+      even when the allowlist turns it off;
+    * a surface the config authorises to apply — its applier is expected to
+      record the same way, so silence there is the configuration's own
+      statement that the surface owns routing.
+
+    Everything else (``cron``, ``delegation``, ``tui``, unmapped front ends) is
+    observed instead.
+    """
+    name = _clean_str(surface).strip().lower()
+    if name in _APPLIER_SURFACES:
+        return True
+    return surface_allowed_to_apply(config, name)
+
+
+def _is_gateway_channel(name: str) -> bool:
+    """True when ``name`` is a platform the gateway serves (structural check).
+
+    A gateway agent carries the *channel* it serves (``telegram``, ``signal``,
+    …) rather than the surface name, so channels have to be recognised to keep
+    the observer out of their applier's telemetry. Membership is decided by
+    constructing ``gateway.config.Platform`` — the same structural test the TUI
+    gateway uses — so registered plugin platforms are covered without a
+    hardcoded list. When the gateway package cannot be imported there is no
+    gateway applier in this process either, so answering ``False`` can only cost
+    an extra observation, never a duplicate record.
+    """
+    if not name:
+        return False
+    try:
+        from gateway.config import Platform
+    except Exception:
+        return False
+    try:
+        Platform(name)
+    except Exception:
+        return False
+    return True
+
+
+def surface_for_platform(platform: Any) -> str:
+    """Map an agent's ``platform`` to a routing surface (``""`` when unmapped).
+
+    Agents are stamped with what they are talking to — ``cli``, ``tui``,
+    ``cron``, ``subagent``, or the channel a gateway agent serves — while the
+    routing config names surfaces. Only a mapping returns a name in
+    :data:`SURFACES`; anything unmapped (``desktop``, ``acp``, a bare plugin
+    tag) answers ``""``, which is treated as a surface that may not apply. That
+    is the fail-open direction for evidence: an unnamed surface is by definition
+    not on the apply allowlist, and observing it costs a log line, while
+    suppressing it would lose the turn.
+    """
+    name = _clean_str(platform).strip().lower()
+    if not name:
+        return ""
+    if name in SURFACES:
+        return name
+    if name in _DELEGATION_PLATFORMS:
+        return "delegation"
+    if name in _GATEWAY_UNPLANNED_PLATFORMS:
+        # Served by the gateway, but its turn-config builder returns before a
+        # decision exists (pinned/request-oriented), so observe rather than
+        # defer to an applier that will not write anything.
+        return ""
+    if _is_gateway_channel(name):
+        return "gateway"
+    return ""
+
+
 def _tier_entries(
     tiers: Any, tier: str
 ) -> Tuple[Dict[str, str], ...]:
@@ -1143,11 +1274,7 @@ def plan_route_application(
     )
     try:
         cfg = load_adaptive_config(config)
-        active = (
-            cfg["enabled"]
-            and cfg["apply_routes"]
-            and not cfg["shadow_mode"]
-        )
+        active = bool(cfg["enabled"]) and _application_is_live(cfg)
         if (
             not active
             or bool(explicit_pin)
@@ -1166,7 +1293,7 @@ def plan_route_application(
         if not provider or not model or decision.pinned:
             return original
         surface_name = _clean_str(surface).lower()
-        if not bool((cfg.get("surfaces") or {}).get(surface_name, False)):
+        if not surface_allowed_to_apply(cfg, surface_name):
             return _denied_plan(decision, _SURFACE_NOT_ALLOWED)
         return _budget_gate(_plan_from_decision(decision), decision, cfg, budget_state)
     except Exception:
@@ -1239,19 +1366,33 @@ def should_observe_first_turn(
     has_history: bool,
     explicit_provider: str = "",
     explicit_model: str = "",
+    surface: Any = "",
 ) -> bool:
-    """Observe only when routing is enabled and this is the first turn.
+    """Observe when routing is enabled, this is the first turn, and no other
+    writer already owns this surface's telemetry.
 
     ``explicit_provider``/``explicit_model`` are accepted for callers that want
     to reason about pins later; today a pinned turn is still worth observing
     (the shadow log records that a pin overrode the router).
+
+    ``surface`` is the surface this turn belongs to
+    (:func:`surface_for_platform`). With application live, a surface that owns
+    its telemetry (``cli``/``gateway``, or anything the allowlist authorises) is
+    *not* observed — its applier records the same decision, and observing it too
+    would double-log every first turn. Any other surface, including an unnamed
+    one (``""``: an agent whose platform maps to no surface is not on the apply
+    allowlist either), is observed. With application off (shadow mode or
+    ``apply_routes: false``) every surface observes, exactly as in Phase 1.
     """
     try:
         cfg = load_adaptive_config(config)
     except Exception:
         return False
-    observe_only = bool(cfg["shadow_mode"]) or not bool(cfg["apply_routes"])
-    return bool(cfg["enabled"]) and observe_only and not bool(has_history)
+    if not bool(cfg["enabled"]) or bool(has_history):
+        return False
+    if not _application_is_live(cfg):
+        return True
+    return not surface_owns_its_telemetry(cfg, surface)
 
 
 # ── telemetry (bounded, enumerated, no user text) ────────────────────────────
@@ -1432,20 +1573,30 @@ def observe_shadow_route(
 ) -> Optional[RouteDecision]:
     """Classify a first turn, record the shadow decision, change nothing.
 
+    Observation is decided per surface, so the appliers and this observer never
+    write the same turn twice: while application is live, ``cli``/``gateway``
+    record their own decision (applied, or denied with a gate reason) and are
+    skipped here, while every other surface — ``tui``, ``cron``,
+    ``delegation``/``subagent``, unmapped front ends — records a non-applied
+    observation prefixed with the ``observe_only_surface`` reason code. When
+    application is off (shadow mode / ``apply_routes: false``) every surface is
+    observed, exactly as in Phase 1.
+
     Returns ``None`` when routing is disabled, when this is not a first turn,
-    or on any error. It never mutates ``agent``, never changes the effective
-    provider/model, and never calls a model.
+    when the surface owns its own telemetry, or on any error. It never mutates
+    ``agent``, never changes the effective provider/model, and never calls a
+    model.
     """
     try:
         cfg = load_adaptive_config(config)
-        if not cfg["enabled"] or (
-            cfg["apply_routes"] and not cfg["shadow_mode"]
-        ):
-            # Inert path: no classification, no routing, no file, no log line.
-            return None
+        surface = surface_for_platform(getattr(agent, "platform", ""))
         if not should_observe_first_turn(
-            config=cfg, has_history=bool(conversation_history)
+            config=cfg,
+            has_history=bool(conversation_history),
+            surface=surface,
         ):
+            # Disabled, not a first turn, or a surface that records its own
+            # route (no classification, no routing, no file, no log line).
             return None
 
         effective_provider = _clean_str(getattr(agent, "provider", ""))
@@ -1470,12 +1621,23 @@ def observe_shadow_route(
             explicit_provider=explicit_provider,
             explicit_model=explicit_model,
         )
+        if _application_is_live(cfg) and not surface_owns_its_telemetry(cfg, surface):
+            # Application is running and this surface may not apply: say so in
+            # the record, so the evidence reads "would have routed, was not
+            # allowed to" instead of looking like an ordinary shadow turn.
+            decision = replace(
+                decision,
+                reason_codes=_dedupe(
+                    (_OBSERVE_ONLY_SURFACE,) + tuple(decision.reason_codes)
+                ),
+            )
         record_shadow_decision(
             decision,
             effective_provider=effective_provider,
             effective_model=effective_model,
             session_id=getattr(agent, "session_id", ""),
             platform=getattr(agent, "platform", ""),
+            surface=surface,
         )
         return decision
     except Exception:
