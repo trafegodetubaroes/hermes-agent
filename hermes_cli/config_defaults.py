@@ -223,6 +223,9 @@ DEFAULT_CONFIG = {
             "apply_routes": False,
             "shadow_mode": True,
             "mode": "balanced",
+            # "normal" | "local_only". local_only pins every routed turn to the
+            # local tier so prompt content never leaves the machine.
+            "privacy": "normal",
             "max_escalations": 2,
             "tiers": {
                 "local": [],

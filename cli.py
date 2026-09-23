@@ -9330,6 +9330,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            # Adaptive-routing session state travels with the runtime: a
+            # one-turn switch must not leave the session looking
+            # router-owned (which would silently disable routing after the
+            # override is restored).
+            "_adaptive_route_owned": getattr(self, "_adaptive_route_owned", False),
+            "_session_route_explicit": getattr(self, "_session_route_explicit", False),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -9348,6 +9354,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key",
             "base_url",
             "api_mode",
+            "_adaptive_route_owned",
+            "_session_route_explicit",
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
@@ -14105,7 +14113,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
+        turn_route = self._resolve_turn_agent_config(message, has_images=bool(images))
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -18838,7 +18846,9 @@ def main(
                                 single_query_images,
                                 announce=False,
                             )
-                    turn_route = cli._resolve_turn_agent_config(effective_query)
+                    turn_route = cli._resolve_turn_agent_config(
+                        effective_query, has_images=bool(single_query_images)
+                    )
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
                     if cli._init_agent(

@@ -844,3 +844,224 @@ def test_provider_scoped_runtime_resolution_honours_max_tokens_env(monkeypatch):
     ):
         fallback = _resolve_runtime_agent_kwargs_for_provider("ollama")
     assert fallback["max_tokens"] == 512
+
+
+# ── second-round review follow-ups ───────────────────────────────────────────
+
+
+def test_message_has_images_detects_every_supported_payload_shape():
+    assert ar.message_has_images("plain text") is False
+    assert ar.message_has_images(None) is False
+    assert ar.message_has_images([{"type": "text", "text": "hi"}]) is False
+    assert ar.message_has_images([{"type": "image_url", "image_url": {}}]) is True
+    assert ar.message_has_images([{"type": "input_image"}]) is True
+    # Non-str/sequence payloads are treated as multimodal attachments.
+    assert ar.message_has_images({"path": "shot.png"}) is True
+
+
+def _vision_config() -> dict:
+    return _adaptive_config(
+        tiers={
+            "local": [{"provider": "ollama", "model": "qwen3:4b"}],
+            "workhorse": [{"provider": "openrouter", "model": "workhorse/model"}],
+            "multimodal": [{"provider": "gemini", "model": "vision-model"}],
+        }
+    )
+
+
+def test_image_first_turn_reaches_the_multimodal_tier():
+    text_only = _plan(config=_vision_config())
+    with_image = _plan(config=_vision_config(), has_images=True)
+
+    assert text_only.tier == "local"
+    assert with_image.should_apply is True
+    assert with_image.tier == "multimodal"
+    assert (with_image.provider, with_image.model) == ("gemini", "vision-model")
+
+
+def test_cli_image_turn_routes_to_vision_and_pins_still_win():
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    shell = _cli_shell(config=_vision_config())
+    bound = CLIAgentSetupMixin._resolve_turn_agent_config.__get__(shell)
+
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=_resolved_ollama_runtime(),
+    ):
+        # Images arrive as a separate `images=` argument in the CLI.
+        routed = bound("o que tem nessa imagem?", has_images=True)
+    assert routed["model"] == "vision-model"
+
+    pinned = _cli_shell(config=_vision_config(), _session_route_explicit=True)
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=_resolved_ollama_runtime(),
+    ):
+        kept = CLIAgentSetupMixin._resolve_turn_agent_config.__get__(pinned)(
+            "o que tem nessa imagem?", has_images=True
+        )
+    assert kept["model"] == "original/model"
+
+
+def test_gateway_image_turn_is_classified_as_vision():
+    from gateway.run import GatewayRunner
+
+    source = _gateway_source()
+    runner, key = _gateway_runner(source)
+    bound = GatewayRunner._resolve_turn_agent_config.__get__(runner)
+    vision_runtime = _resolved_ollama_runtime()
+    vision_runtime["provider"] = "gemini"
+
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value=vision_runtime,
+    ) as resolve_runtime:
+        route = bound(
+            "o que tem nessa imagem?",
+            "original/model",
+            _runtime(),
+            session_key=key,
+            user_config=_vision_config(),
+            has_history=False,
+            source=source,
+            has_images=True,
+        )
+
+    assert route["model"] == "vision-model"
+    assert runner._session_model_overrides[key]["model"] == "vision-model"
+    assert resolve_runtime.call_args.args[0] == "gemini"
+
+
+def test_gateway_peek_does_not_drain_pending_image_paths():
+    from gateway.run import GatewayRunner
+
+    source = _gateway_source()
+    runner, key = _gateway_runner(source)
+    state = SimpleNamespace(
+        persistent=SimpleNamespace(native_image_paths=["a.png", "b.png"])
+    )
+
+    with patch.object(GatewayRunner, "_peek_session_state", return_value=state):
+        assert runner._peek_pending_native_image_paths(key) == ["a.png", "b.png"]
+        # Peek must be non-destructive: the turn still needs to attach them.
+        assert state.persistent.native_image_paths == ["a.png", "b.png"]
+
+
+def test_one_turn_and_moa_overrides_are_pins_for_their_turn():
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    cases = (
+        {"_pending_one_turn_model_restore": {"model": "user/once-model"}},
+        {"_pending_moa_disable_after_turn": True},
+    )
+    for overrides in cases:
+        shell = _cli_shell(config=_adaptive_config(), **overrides)
+        bound = CLIAgentSetupMixin._resolve_turn_agent_config.__get__(shell)
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=_resolved_ollama_runtime(),
+        ) as resolve_runtime:
+            route = bound("Renomeie essas variaveis")
+        assert route["model"] == "original/model", overrides
+        assert route["runtime"]["provider"] == "openrouter", overrides
+        resolve_runtime.assert_not_called()
+
+    # A plain first turn is still routed.
+    plain = _cli_shell(config=_adaptive_config())
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=_resolved_ollama_runtime(),
+    ):
+        routed = CLIAgentSetupMixin._resolve_turn_agent_config.__get__(plain)(
+            "Renomeie essas variaveis"
+        )
+    assert routed["model"] == "qwen3:4b"
+
+
+def test_one_turn_snapshot_restores_adaptive_owned_state():
+    from cli import HermesCLI
+
+    shell = SimpleNamespace(
+        model="original/model",
+        provider="openrouter",
+        requested_provider="openrouter",
+        api_key="sk",
+        base_url="https://openrouter.example/v1",
+        api_mode="chat_completions",
+        agent=None,
+        _adaptive_route_owned=True,
+        _session_route_explicit=True,
+    )
+    snapshot = HermesCLI._snapshot_model_runtime.__get__(shell)()
+
+    shell._adaptive_route_owned = False
+    shell._session_route_explicit = False
+    shell.model = "user/once-model"
+    HermesCLI._restore_model_runtime_snapshot.__get__(shell)(snapshot)
+
+    assert shell.model == "original/model"
+    assert shell._adaptive_route_owned is True
+    assert shell._session_route_explicit is True
+
+
+def test_gateway_rollback_uses_the_same_config_source_as_apply():
+    from gateway.run import GatewayRunner
+
+    source = _gateway_source()
+    runner, key = _gateway_runner(source)
+    runner._session_model_overrides[key] = {
+        "model": "qwen3:4b",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "adaptive_router": True,
+    }
+    bound = GatewayRunner._apply_session_model_override.__get__(runner)
+
+    # Per-turn config says routing is ON (enabled + apply_routes) even though
+    # the on-disk config is off: the sticky route must NOT be dropped, or the
+    # conversation would silently change model mid-flight.
+    model, runtime = bound(key, "original/model", _runtime(), user_config=_adaptive_config())
+    assert model == "qwen3:4b"
+    assert runtime["provider"] == "ollama"
+
+    # Same per-turn config with apply_routes off releases the router route.
+    runner._session_model_overrides[key] = {
+        "model": "qwen3:4b",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "adaptive_router": True,
+    }
+    released, rel_runtime = bound(
+        key,
+        "original/model",
+        _runtime(),
+        user_config=_adaptive_config(apply_routes=False, shadow_mode=True),
+    )
+    assert released == "original/model"
+    assert rel_runtime["provider"] == "openrouter"
+    assert key not in runner._session_model_overrides
+
+
+def test_cli_routing_telemetry_never_records_the_raw_session_id():
+    shell = _cli_shell(config=_adaptive_config(), session_id="20260922_120000_abcdef")
+    bound = __import__(
+        "hermes_cli.cli_agent_setup_mixin", fromlist=["CLIAgentSetupMixin"]
+    ).CLIAgentSetupMixin._resolve_turn_agent_config.__get__(shell)
+
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=_resolved_ollama_runtime(),
+    ), patch.object(ar, "record_shadow_decision") as telemetry:
+        route = bound("Renomeie essas variaveis")
+
+    assert route["model"] == "qwen3:4b"
+    recorded = telemetry.call_args.kwargs["session_id"]
+    assert recorded == ar.session_ref("20260922_120000_abcdef")
+    assert "20260922_120000_abcdef" not in recorded
+
+
+def test_default_config_documents_the_privacy_contract():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["agent"]["adaptive_routing"]["privacy"] == "normal"

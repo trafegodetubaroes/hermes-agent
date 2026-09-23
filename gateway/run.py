@@ -2691,10 +2691,12 @@ def _resolve_runtime_agent_kwargs_for_provider(
             max_tokens = int(_env_mt)
         except (ValueError, TypeError):
             max_tokens = None
-    elif isinstance(_get_model_config(), dict):
-        mt = _get_model_config().get("max_tokens")
-        if isinstance(mt, int):
-            max_tokens = mt
+    else:
+        model_cfg = _get_model_config()
+        if isinstance(model_cfg, dict):
+            mt = model_cfg.get("max_tokens")
+            if isinstance(mt, int):
+                max_tokens = mt
     if max_tokens is None:
         _runtime_mot = runtime.get("max_output_tokens")
         if isinstance(_runtime_mot, int) and _runtime_mot > 0:
@@ -4783,6 +4785,12 @@ class TurnRunner:
             user_config=ctx.user_config,
             has_history=bool(ctx.history),
             source=ctx.source,
+            # Image-bearing first turns must be able to reach a vision tier.
+            # Peek (do not consume) — the same buffer is attached to the agent
+            # message later in this turn.
+            has_images=bool(
+                self._runner._peek_pending_native_image_paths(ctx.session_key)
+            ),
         )
 
         # Per-platform skip_context_files — messaging platforms can opt out
@@ -7209,7 +7217,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
-                resolved_session_key, model, runtime_kwargs
+                resolved_session_key,
+                model,
+                runtime_kwargs,
+                user_config=user_config,
             )
 
         # When the config has no model.default but a provider was resolved
@@ -7275,6 +7286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config: Optional[dict] = None,
         has_history: bool = False,
         source: Optional[SessionSource] = None,
+        has_images: bool = False,
     ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
@@ -7310,6 +7322,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.adaptive_routing import (
                 plan_route_application,
                 record_shadow_decision,
+                message_has_images,
                 session_ref,
             )
             record_routing_decision = record_shadow_decision
@@ -7349,16 +7362,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     channel_pin = True
 
-            plan = plan_route_application(
-                message=user_message,
-                current_model=model,
-                current_runtime=runtime,
-                config=user_config or {},
-                explicit_pin=bool(existing_override or channel_pin or skip_surface),
-                has_history=bool(has_history),
-                session_is_new=not bool(existing_override),
-            )
-            if plan.should_apply and session_key:
+            # Only a session-scoped turn can be routed; a session-less call
+            # (internal/background builders) has nothing to stay sticky on.
+            if session_key:
+                plan = plan_route_application(
+                    message=user_message,
+                    current_model=model,
+                    current_runtime=runtime,
+                    config=user_config or {},
+                    explicit_pin=bool(existing_override or channel_pin or skip_surface),
+                    has_history=bool(has_history),
+                    session_is_new=not bool(existing_override),
+                    has_images=bool(has_images) or message_has_images(user_message),
+                )
+            if plan is not None and plan.should_apply and session_key:
                 candidate = dict(
                     _resolve_runtime_agent_kwargs_for_provider(
                         plan.provider,
@@ -17103,6 +17120,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state.persistent.native_image_paths = []
         return paths
 
+    def _peek_pending_native_image_paths(self, session_key: str) -> List[str]:
+        """Return buffered native image paths WITHOUT consuming them.
+
+        Callers that need to reason about this turn's attachments (routing,
+        capability decisions) must not drain the buffer — the turn itself
+        consumes it when it builds the multimodal message.
+        """
+        try:
+            state = self._peek_session_state(session_key)
+        except Exception:
+            return []
+        if state is None or not state.persistent.native_image_paths:
+            return []
+        return list(state.persistent.native_image_paths)
+
     def _cache_session_source(self, session_key: str, source) -> None:
         if not session_key or source is None:
             return
@@ -23872,7 +23904,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _apply_session_model_override(
-        self, session_key: str, model: str, runtime_kwargs: dict
+        self,
+        session_key: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: Optional[dict] = None,
     ) -> tuple:
         """Apply /model session overrides if present, returning (model, runtime_kwargs).
 
@@ -23892,7 +23929,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from agent.adaptive_routing import load_adaptive_config
 
-                adaptive = load_adaptive_config()
+                # Consult the SAME config source the apply used (the turn's
+                # user_config). Reading disk config here could disagree with
+                # the apply and drop a sticky route mid-conversation, which is
+                # exactly the cache-breaking behaviour Phase 2 exists to avoid.
+                adaptive = load_adaptive_config(user_config)
                 active = bool(
                     adaptive.get("enabled")
                     and adaptive.get("apply_routes")

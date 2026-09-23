@@ -967,6 +967,33 @@ def session_ref(raw: Any, *, length: int = 12) -> str:
     return "s" + sha256(text.encode("utf-8")).hexdigest()[:size]
 
 
+#: Content-block types that carry pixels rather than text.
+_IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+
+
+def message_has_images(message: Any) -> bool:
+    """Return True when a user message carries an image payload.
+
+    Mirrors the detection used by the shadow observer: a non-str/sequence
+    payload is assumed multimodal, and a list/tuple is multimodal when any part
+    is an OpenAI-style image content block.
+    """
+    try:
+        if message is None or isinstance(message, str):
+            return False
+        if isinstance(message, (list, tuple)):
+            for part in message:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type", "")).strip().lower() in _IMAGE_PART_TYPES:
+                    return True
+            return False
+        # dict / attachment / provider-native payloads that are not plain text
+        return True
+    except Exception:
+        return False
+
+
 def record_shadow_decision(
     decision: RouteDecision,
     *,

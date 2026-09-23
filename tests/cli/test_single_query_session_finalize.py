@@ -171,7 +171,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append("credentials")
             return True
 
-        def _resolve_turn_agent_config(self, effective_query):
+        def _resolve_turn_agent_config(self, effective_query, **_kwargs):
             calls.append(("resolve", effective_query))
             return {
                 "signature": "same-route",

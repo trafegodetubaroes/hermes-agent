@@ -18,7 +18,7 @@ def test_at_context_resolution_passes_active_provider():
     cli._secret_capture_callback = lambda *_args, **_kwargs: None
     cli._last_turn_interrupted = False
     cli._ensure_runtime_credentials = lambda: True
-    cli._resolve_turn_agent_config = lambda _message: {
+    cli._resolve_turn_agent_config = lambda _message, **_kwargs: {
         "signature": "route",
         "model": cli.model,
         "runtime": None,

@@ -282,7 +282,9 @@ class CLIAgentSetupMixin:
         _cprint("  Provider setup didn't complete. Run 'hermes model' to retry.")
         return False
 
-    def _resolve_turn_agent_config(self, user_message: str) -> dict:
+    def _resolve_turn_agent_config(
+        self, user_message: str, *, has_images: bool = False
+    ) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
         Always uses the session's primary model/provider.  If the user has
@@ -315,6 +317,8 @@ class CLIAgentSetupMixin:
             from agent.adaptive_routing import (
                 plan_route_application,
                 record_shadow_decision,
+                message_has_images,
+                session_ref,
             )
             record_routing_decision = record_shadow_decision
 
@@ -323,17 +327,25 @@ class CLIAgentSetupMixin:
                 current_model=self.model,
                 current_runtime=runtime,
                 config=getattr(self, "config", {}),
-                # Process-level --model/--provider flags and an interactive
-                # /model choice in this session both win over the router.
+                # Every explicit user intent beats the router:
+                #  - --model/--provider/--api-key/--base-url at launch,
+                #  - an interactive /model choice in this session,
+                #  - a pending one-turn /model --once override (the user was
+                #    told it applies to the next turn),
+                #  - a pending one-shot /moa turn (provider="moa" must not be
+                #    rewritten to a tier model).
                 explicit_pin=bool(
                     getattr(self, "_startup_route_explicit", False)
                     or getattr(self, "_session_route_explicit", False)
+                    or getattr(self, "_pending_one_turn_model_restore", None)
+                    or getattr(self, "_pending_moa_disable_after_turn", False)
                 ),
                 has_history=bool(getattr(self, "conversation_history", None)),
                 session_is_new=(
                     not bool(getattr(self, "_resumed", False))
                     and not bool(getattr(self, "_adaptive_route_owned", False))
                 ),
+                has_images=bool(has_images) or message_has_images(user_message),
             )
             if plan.should_apply:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -381,7 +393,7 @@ class CLIAgentSetupMixin:
                     plan.decision,
                     effective_provider=candidate_provider,
                     effective_model=plan.model,
-                    session_id=getattr(self, "session_id", ""),
+                    session_id=session_ref(getattr(self, "session_id", "")),
                     platform="cli",
                     applied=True,
                 )
@@ -395,7 +407,7 @@ class CLIAgentSetupMixin:
                     plan.decision,
                     effective_provider=runtime.get("provider"),
                     effective_model=self.model,
-                    session_id=getattr(self, "session_id", ""),
+                    session_id=session_ref(getattr(self, "session_id", "")),
                     platform="cli",
                     applied=False,
                 )
