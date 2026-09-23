@@ -23933,7 +23933,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # user_config). Reading disk config here could disagree with
                 # the apply and drop a sticky route mid-conversation, which is
                 # exactly the cache-breaking behaviour Phase 2 exists to avoid.
-                adaptive = load_adaptive_config(user_config)
+                # ``or {}`` matters: the apply used ``user_config or {}``, and a
+                # config-less rollback must reach the same verdict (routing off)
+                # rather than read the on-disk config.
+                adaptive = load_adaptive_config(user_config or {})
                 active = bool(
                     adaptive.get("enabled")
                     and adaptive.get("apply_routes")

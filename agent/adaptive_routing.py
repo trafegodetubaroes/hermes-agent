@@ -953,9 +953,11 @@ def _resolve_home() -> Optional[Path]:
 def session_ref(raw: Any, *, length: int = 12) -> str:
     """Return a stable, non-reversible reference for a session identifier.
 
-    Gateway chat keys embed platform, chat id and user id. Hashing keeps
-    decisions correlatable across turns without writing a durable chat/user
-    identifier to the routing log.
+    Used when a caller's only available identifier is an external one (a
+    gateway chat key embeds ``platform:chat_id:user_id``), so decisions stay
+    correlatable across turns without writing a durable chat/user identifier to
+    the routing log. Routing surfaces that already hold a locally-generated
+    session id (timestamp + uuid) may record it directly.
     """
     text = _clean_str(raw)
     if not text:
@@ -969,27 +971,48 @@ def session_ref(raw: Any, *, length: int = 12) -> str:
 
 #: Content-block types that carry pixels rather than text.
 _IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+#: Dict keys that mark an image payload even without a ``type`` field.
+_IMAGE_KEYS = (
+    "image_url",
+    "image",
+    "input_image",
+    "image_path",
+    "image_base64",
+    "image_data",
+)
+
+
+def _part_is_image(part: Any) -> bool:
+    if isinstance(part, dict):
+        if str(part.get("type", "")).strip().lower() in _IMAGE_PART_TYPES:
+            return True
+        return any(key in part for key in _IMAGE_KEYS)
+    # A non-text object inside a content list is an attachment payload.
+    return not isinstance(part, str)
 
 
 def message_has_images(message: Any) -> bool:
     """Return True when a user message carries an image payload.
 
-    Mirrors the detection used by the shadow observer: a non-str/sequence
-    payload is assumed multimodal, and a list/tuple is multimodal when any part
-    is an OpenAI-style image content block.
+    Control-path detection: it must err towards "no image" (stay on the cheap
+    tier, where the existing ``vision_analyze`` fallback still describes the
+    pixels) rather than towards the vision tier. Callers that *know* the turn
+    has attachments pass ``has_images=True`` explicitly; this helper is the
+    safety net for content-list payloads.
+
+    Note the shadow *observer* (``agent.turn_context``) intentionally stays
+    fail-open on non-str payloads — it only measures, and a false positive
+    there costs nothing.
     """
     try:
         if message is None or isinstance(message, str):
             return False
         if isinstance(message, (list, tuple)):
-            for part in message:
-                if not isinstance(part, dict):
-                    continue
-                if str(part.get("type", "")).strip().lower() in _IMAGE_PART_TYPES:
-                    return True
-            return False
-        # dict / attachment / provider-native payloads that are not plain text
-        return True
+            return any(_part_is_image(part) for part in message)
+        if isinstance(message, dict):
+            return _part_is_image(message)
+        # Unknown provider-native object type: not provably an image.
+        return False
     except Exception:
         return False
 

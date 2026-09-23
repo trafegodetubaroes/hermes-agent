@@ -855,8 +855,20 @@ def test_message_has_images_detects_every_supported_payload_shape():
     assert ar.message_has_images([{"type": "text", "text": "hi"}]) is False
     assert ar.message_has_images([{"type": "image_url", "image_url": {}}]) is True
     assert ar.message_has_images([{"type": "input_image"}]) is True
-    # Non-str/sequence payloads are treated as multimodal attachments.
-    assert ar.message_has_images({"path": "shot.png"}) is True
+    assert ar.message_has_images({"type": "image", "source": {}}) is True
+    assert ar.message_has_images({"image_url": {"url": "http://x/y.png"}}) is True
+    # A non-text object inside a content list is an attachment payload.
+    assert ar.message_has_images(["caption", object()]) is True
+
+
+def test_message_has_images_is_conservative_for_ambiguous_payloads():
+    """Control path errs towards the cheap tier: only positive evidence wins."""
+    assert ar.message_has_images({"text": "no pixels here"}) is False
+    assert ar.message_has_images({"path": "shot.png"}) is False
+    assert ar.message_has_images([{"type": "text", "text": "a"}, {"text": "b"}]) is False
+    # Ambiguity must not move a text turn onto the (pricier) vision tier.
+    plan = _plan(config=_vision_config(), message={"text": "apenas texto"})
+    assert plan.tier == "local"
 
 
 def _vision_config() -> dict:
@@ -1041,6 +1053,43 @@ def test_gateway_rollback_uses_the_same_config_source_as_apply():
     assert released == "original/model"
     assert rel_runtime["provider"] == "openrouter"
     assert key not in runner._session_model_overrides
+
+
+def test_gateway_rollback_without_user_config_matches_the_apply_default_off():
+    """A config-less rollback must not read the on-disk config to decide."""
+    from gateway.run import GatewayRunner
+
+    source = _gateway_source()
+    runner, key = _gateway_runner(source)
+    runner._session_model_overrides[key] = {
+        "model": "qwen3:4b",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "adaptive_router": True,
+    }
+    bound = GatewayRunner._apply_session_model_override.__get__(runner)
+    disk_on = _adaptive_config()
+
+    # The apply used `user_config or {}` (routing off); the rollback must reach
+    # the same verdict instead of consulting a disk config that says otherwise.
+    with patch.object(ar, "_read_config_from_disk", return_value=disk_on):
+        released, rel_runtime = bound(key, "original/model", _runtime())
+
+    assert released == "original/model"
+    assert rel_runtime["provider"] == "openrouter"
+    assert key not in runner._session_model_overrides
+
+    # Sanity: an explicit user_config is passed straight through.
+    runner._session_model_overrides[key] = {
+        "model": "qwen3:4b",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "adaptive_router": True,
+    }
+    with patch.object(ar, "load_adaptive_config", wraps=ar.load_adaptive_config) as spy:
+        kept, _ = bound(key, "original/model", _runtime(), user_config=disk_on)
+    assert kept == "qwen3:4b"
+    assert spy.call_args.args[0] == disk_on
 
 
 def test_cli_routing_telemetry_never_records_the_raw_session_id():
