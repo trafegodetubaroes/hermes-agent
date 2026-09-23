@@ -694,6 +694,7 @@ def test_record_shadow_decision_writes_one_bounded_line_and_no_user_text(tmp_pat
     assert set(record) == {
         "ts",
         "session_id",
+        "session_ref",
         "platform",
         "tier",
         "provider",
@@ -743,6 +744,31 @@ def test_record_shadow_decision_matched_flag_is_true_on_agreement(tmp_path):
 
     record_shadow_decision(
         decision, effective_provider="", effective_model="", home=tmp_path
+    )
+    assert _read_shadow_lines(tmp_path)[1]["matched"] is False
+
+
+def test_matched_ignores_provider_alias_suffix(tmp_path):
+    """Só o sufixo/alias do provider não é divergência de rota (phase3-3).
+
+    A config escreve ``custom:local-qwen`` e o resolver devolve ``custom``; o
+    modelo é o mesmo. Antes esse caso era contado como "não bateu" e o flag
+    subcontava (medido: 11/21 no flag contra 21/21 no modelo).
+    """
+    decision = resolve_route(classify_task(message="Renomeie essas variáveis"), config=_config())
+    record_shadow_decision(
+        decision,
+        effective_provider="ollama",
+        effective_model=decision.model,
+        home=tmp_path,
+    )
+    record = _read_shadow_lines(tmp_path)[0]
+    assert record["provider"] == "ollama"
+    assert record["matched"] is True
+
+    # provider de verdade DIFERENTE (não só alias) continua False
+    record_shadow_decision(
+        decision, effective_provider="outro-provider", effective_model=decision.model, home=tmp_path
     )
     assert _read_shadow_lines(tmp_path)[1]["matched"] is False
 

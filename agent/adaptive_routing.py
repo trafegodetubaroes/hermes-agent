@@ -84,7 +84,7 @@ MODES: Tuple[str, ...] = ("economy", "balanced", "quality", "maximum")
 
 #: Bumped whenever the classifier/route heuristics change, so shadow logs from
 #: different generations stay distinguishable.
-ROUTER_VERSION = "phase3-2"
+ROUTER_VERSION = "phase3-3"
 
 #: One JSON line per observation, appended under HERMES_HOME.
 SHADOW_LOG_NAME = "adaptive_routing_shadow.jsonl"
@@ -297,6 +297,7 @@ _SIMPLE_VERB_PATTERN = _compile_whole_words(_SIMPLE_VERB_KEYWORDS)
 _SHADOW_JSON_FIELDS: Tuple[str, ...] = (
     "ts",
     "session_id",
+    "session_ref",
     "platform",
     "tier",
     "provider",
@@ -1165,6 +1166,18 @@ def _denied_plan(decision: RouteDecision, code: str) -> RouteApplicationPlan:
     )
 
 
+def _provider_base(value: Any) -> str:
+    """Provider sem o sufixo de variante/alias (``custom:local-qwen`` -> ``custom``).
+
+    A config escreve o provider com alias (``custom:local-qwen``) e o resolver
+    devolve a base (``custom``): comparar a string crua contava toda rota local
+    como divergente. Medido em 23/09 — flag ``matched`` 11/21 (52%) enquanto o
+    modelo efetivo batia em 21/21 (100%). A base elimina o falso negativo sem
+    esconder divergência real (trocar de provider de verdade continua False).
+    """
+    return _clean_str(value).split(":", 1)[0].strip().lower()
+
+
 def _budget_remaining(
     counts: Dict[str, Any], tier: str, caps: Dict[str, int]
 ) -> Optional[int]:
@@ -1523,6 +1536,10 @@ def record_shadow_decision(
         record = {
             "ts": float(time.time()),
             "session_id": _bounded(session_id, 128),
+            # Mesma referencia de sessao que o shadow do Jev grava: e por esta
+            # chave que os dois logs se correlacionam sem guardar identificador
+            # externo (chat/user) nem texto de mensagem.
+            "session_ref": session_ref(session_id),
             "platform": _bounded(platform, 32),
             "tier": _bounded(getattr(decision, "tier", ""), 32),
             "provider": _bounded(provider, 64),
@@ -1540,11 +1557,13 @@ def record_shadow_decision(
             "effective_model": _bounded(effective_model, 128),
             "applied": bool(applied),
             "surface": _bounded(surface, 32),
+            # ``matched`` responde "a rota escolhida foi a que rodou?": modelo
+            # igual E provider igual **na base** (alias de config não é
+            # divergência). Fica em False quando o provider difere de fato.
             "matched": bool(
-                provider
-                and model
-                and provider == effective_provider
+                model
                 and model == effective_model
+                and _provider_base(provider) == _provider_base(effective_provider)
             ),
             "router_version": ROUTER_VERSION,
         }
