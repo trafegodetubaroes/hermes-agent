@@ -123,9 +123,13 @@ def load_shadow_config(config: Any = None) -> Dict[str, Any]:
     section = config
     try:
         if section is None:
-            from agent.adaptive_routing import load_adaptive_config  # noqa: WPS433
+            # Ler o config CRU: ``load_adaptive_config`` devolve a seção já
+            # normalizada, que descarta chaves que ela não conhece — e
+            # ``jev_shadow`` é justamente uma delas.
+            from hermes_cli.config import load_config_readonly  # noqa: WPS433
 
-            section = load_adaptive_config() or {}
+            raw_config = load_config_readonly() or {}
+            section = (raw_config.get("agent") or {}).get("adaptive_routing") or {}
         elif isinstance(section, dict) and "agent" in section:
             agent = section.get("agent")
             if isinstance(agent, dict):
